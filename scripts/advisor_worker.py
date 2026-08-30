@@ -362,9 +362,24 @@ def app_server_command(session: Path, cwd: Path, runtime_file: Path, allow_shell
 
 
 def app_server_environment(session: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    source_home = Path(environment.get("CODEX_HOME") or (Path.home() / ".codex"))
     nested_home = session / "codex-home"
     nested_home.mkdir(parents=True, exist_ok=True)
-    environment = os.environ.copy()
+    source_auth = source_home / "auth.json"
+    nested_auth = nested_home / "auth.json"
+    if source_auth.is_file():
+        if nested_auth.exists() and not os.path.samefile(source_auth, nested_auth):
+            nested_auth.unlink()
+        if not nested_auth.exists():
+            try:
+                os.link(source_auth, nested_auth)
+            except OSError as error:
+                raise AppServerError(
+                    "Advisor could not securely share the existing Codex login with its "
+                    "isolated app-server. Re-enable Advisor or restart Codex after checking "
+                    f"access to {source_auth}."
+                ) from error
     environment["CODEX_ADVISOR_NESTED"] = "1"
     environment["CODEX_HOME"] = str(nested_home)
     return environment

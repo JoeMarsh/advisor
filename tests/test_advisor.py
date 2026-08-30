@@ -301,10 +301,25 @@ class McpBridgeTests(unittest.TestCase):
 
     def test_app_server_uses_an_isolated_nested_codex_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            session = Path(directory) / "session"
-            environment = app_server_environment(session)
-        self.assertEqual(environment["CODEX_HOME"], str(session / "codex-home"))
-        self.assertEqual(environment["CODEX_ADVISOR_NESTED"], "1")
+            root = Path(directory)
+            source_home = root / "source-home"
+            source_home.mkdir()
+            source_auth = source_home / "auth.json"
+            source_auth.write_text('{"test":"credential"}', encoding="utf-8")
+            session = root / "session"
+            previous_home = os.environ.get("CODEX_HOME")
+            os.environ["CODEX_HOME"] = str(source_home)
+            try:
+                environment = app_server_environment(session)
+            finally:
+                if previous_home is None:
+                    os.environ.pop("CODEX_HOME", None)
+                else:
+                    os.environ["CODEX_HOME"] = previous_home
+            nested_auth = session / "codex-home" / "auth.json"
+            self.assertTrue(os.path.samefile(source_auth, nested_auth))
+            self.assertEqual(environment["CODEX_HOME"], str(session / "codex-home"))
+            self.assertEqual(environment["CODEX_ADVISOR_NESTED"], "1")
 
     def test_unpaired_surrogate_is_sanitized_before_advice_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
