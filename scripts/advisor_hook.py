@@ -473,27 +473,6 @@ def enqueue_update(session: Path, path: Path | None, cwd: Path, event: str) -> i
         return generation
 
 
-def claim_delivery_waiter(session: Path, lease_seconds: float) -> bool:
-    path = session / "delivery-waiter.json"
-    with FileLock(session / "delivery-waiter.lock", timeout=10, stale_after=30):
-        state = load_json(path, {})
-        now = time.time()
-        existing_pid = int(state.get("pid", 0)) if isinstance(state, dict) else 0
-        expires = float(state.get("expires_at", 0)) if isinstance(state, dict) else 0
-        if existing_pid != os.getpid() and expires > now and process_is_running(existing_pid):
-            return False
-        save_json(path, {"pid": os.getpid(), "expires_at": now + lease_seconds})
-        return True
-
-
-def release_delivery_waiter(session: Path) -> None:
-    path = session / "delivery-waiter.json"
-    with FileLock(session / "delivery-waiter.lock", timeout=10, stale_after=30):
-        state = load_json(path, {})
-        if isinstance(state, dict) and int(state.get("pid", 0)) == os.getpid():
-            path.unlink(missing_ok=True)
-
-
 def wait_for_generation(session: Path, generation: int, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -614,13 +593,6 @@ def main() -> int:
                 generation,
                 float(config.get("timeout_seconds", 300)) + 20,
             )
-        else:
-            wait_seconds = float(config.get("timeout_seconds", 300)) + 20
-            if claim_delivery_waiter(session, wait_seconds + 10):
-                try:
-                    wait_for_generation(session, generation, wait_seconds)
-                finally:
-                    release_delivery_waiter(session)
         notes, warnings = drain_deliveries(session)
 
     if notes:

@@ -4,12 +4,10 @@ import argparse
 import json
 import os
 import queue
-import re
 import subprocess
 import sys
 import threading
 import time
-import tomllib
 import uuid
 from pathlib import Path
 from typing import Any
@@ -344,6 +342,7 @@ def update_worker_state(session: Path, **values: Any) -> None:
 def app_server_command(session: Path, cwd: Path, runtime_file: Path, allow_shell: bool) -> list[str]:
     command = ["codex", "app-server", "--stdio"]
     overrides = [
+        "notify=[]",
         "features.apps=false",
         "features.goals=false",
         "features.hooks=false",
@@ -356,38 +355,19 @@ def app_server_command(session: Path, cwd: Path, runtime_file: Path, allow_shell
         'web_search="disabled"',
     ]
     requested = requested_advisor_tools(cwd)
-    allowed_servers = {"advisor"}
-    if requested.intersection({"lsp", "debug"}):
-        allowed_servers.add("godot-rust-devtools")
-    for server_name in configured_mcp_server_names(cwd):
-        if server_name not in allowed_servers:
-            segment = server_name if re.fullmatch(r"[A-Za-z0-9_-]+", server_name) else json.dumps(server_name)
-            overrides.append(f"mcp_servers.{segment}.enabled=false")
     overrides.extend(mcp_overrides(session, cwd, runtime_file=runtime_file))
     for override in overrides:
         command.extend(["-c", override])
     return command
 
 
-def configured_mcp_server_names(cwd: Path) -> set[str]:
-    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
-    candidates = [codex_home / "config.toml"]
-    candidates.extend(base / ".codex" / "config.toml" for base in reversed([cwd, *cwd.parents]))
-    names: set[str] = set()
-    seen: set[str] = set()
-    for path in candidates:
-        key = os.path.normcase(str(path.resolve()))
-        if key in seen or not path.is_file():
-            continue
-        seen.add(key)
-        try:
-            document = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
-            continue
-        servers = document.get("mcp_servers")
-        if isinstance(servers, dict):
-            names.update(str(name) for name in servers)
-    return names
+def app_server_environment(session: Path) -> dict[str, str]:
+    nested_home = session / "codex-home"
+    nested_home.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    environment["CODEX_ADVISOR_NESTED"] = "1"
+    environment["CODEX_HOME"] = str(nested_home)
+    return environment
 
 
 class AdvisorWorker:
@@ -413,8 +393,7 @@ class AdvisorWorker:
         self.close_app()
         active_file = self.session / "active-update.json"
         command = app_server_command(self.session, cwd, active_file, "bash" in tools)
-        environment = os.environ.copy()
-        environment["CODEX_ADVISOR_NESTED"] = "1"
+        environment = app_server_environment(self.session)
         app = AppServerClient(command, cwd, environment, self.session / "advisor.log")
         app.start()
         runtime = load_json(runtime_path(self.session), {})

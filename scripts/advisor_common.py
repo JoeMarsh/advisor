@@ -37,10 +37,23 @@ def plugin_root() -> Path:
     return Path(os.environ.get("PLUGIN_ROOT", Path(__file__).resolve().parents[1])).resolve()
 
 
+def installed_plugin_data_root(root: Path, codex_home: Path) -> Path | None:
+    try:
+        relative = root.resolve().relative_to((codex_home / "plugins" / "cache").resolve())
+    except ValueError:
+        return None
+    if len(relative.parts) < 3:
+        return None
+    marketplace, plugin_name = relative.parts[:2]
+    return codex_home / "plugins" / "data" / f"{plugin_name}-{marketplace}"
+
+
 def data_root() -> Path:
     configured = os.environ.get("PLUGIN_DATA")
     codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
-    root = Path(configured) if configured else codex_home / "plugin-data" / "advisor"
+    root = Path(configured) if configured else installed_plugin_data_root(plugin_root(), codex_home)
+    if root is None:
+        root = codex_home / "plugin-data" / "advisor"
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
 
@@ -484,6 +497,7 @@ def record_advice(
 ) -> str:
     _mark_update_spoke(session, update_id)
     severity = severity if severity in SEVERITY_RANK else None
+    note = note.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
     normalized = normalize_note(note)
     delivery_key = " ".join(note.strip().split())
     state = _load_guard(session)

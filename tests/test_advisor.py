@@ -19,6 +19,7 @@ from advisor_common import (  # noqa: E402
     empty_token_usage,
     flush_deferred,
     format_usage_report,
+    installed_plugin_data_root,
     load_usage_state,
     normalize_note,
     normalize_token_usage,
@@ -32,11 +33,28 @@ from advisor_common import (  # noqa: E402
     update_main_usage,
 )
 from advisor_hook import hook_output, mcp_overrides, read_transcript_delta  # noqa: E402
-from advisor_worker import AppServerClient, app_server_command, app_server_usage  # noqa: E402
+from advisor_worker import (  # noqa: E402
+    AppServerClient,
+    app_server_command,
+    app_server_environment,
+    app_server_usage,
+)
 from advisor_prompt_submit import control_arguments, parse_advisor_invocation  # noqa: E402
 
 
 class AdvisorCommonTests(unittest.TestCase):
+    def test_cached_plugin_resolves_its_installed_marketplace_data(self) -> None:
+        codex_home = Path("C:/Users/example/.codex")
+        plugin = codex_home / "plugins" / "cache" / "playground" / "advisor" / "0.1.0"
+        self.assertEqual(
+            installed_plugin_data_root(plugin, codex_home),
+            codex_home / "plugins" / "data" / "advisor-playground",
+        )
+
+    def test_source_plugin_has_no_inferred_installed_data_root(self) -> None:
+        codex_home = Path("C:/Users/example/.codex")
+        self.assertIsNone(installed_plugin_data_root(Path("C:/src/advisor"), codex_home))
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.session = Path(self.temporary.name)
@@ -279,6 +297,25 @@ class McpBridgeTests(unittest.TestCase):
         self.assertEqual(command[:3], ["codex", "app-server", "--stdio"])
         self.assertNotIn("exec", command)
         self.assertIn("features.shell_tool=false", command)
+        self.assertIn("notify=[]", command)
+
+    def test_app_server_uses_an_isolated_nested_codex_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory) / "session"
+            environment = app_server_environment(session)
+        self.assertEqual(environment["CODEX_HOME"], str(session / "codex-home"))
+        self.assertEqual(environment["CODEX_ADVISOR_NESTED"], "1")
+
+    def test_unpaired_surrogate_is_sanitized_before_advice_is_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            start_update(session, "u")
+            self.assertEqual(
+                record_advice(session, "u", f"bad {chr(0xDC9D)} note", "concern"),
+                "Recorded.",
+            )
+            note = read_update_result(session, "u")[0]["note"]
+        self.assertEqual(note, "bad \ufffd note")
 
     def test_nested_advisor_preapproves_only_its_read_only_tools(self) -> None:
         overrides = mcp_overrides(Path("session"), Path("cwd"), "u", False)

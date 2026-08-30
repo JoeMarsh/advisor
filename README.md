@@ -30,9 +30,9 @@ advice. One detached, task-scoped worker owns a persistent `codex app-server`
 process, one advisor thread, and one ordered transcript cursor. The worker runs
 one review at a time and coalesces updates that arrive while a review is pending,
 so Codex's independently scheduled hook processes cannot create parallel advisor
-runs or reorder transcript delivery. One hook holds a delivery lease while the
-worker reviews, allowing completed advice to reach Codex at the next safe point;
-the other matching hooks enqueue and return promptly. `Stop` waits for the final
+runs or reorder transcript delivery. Each fast synchronous hook returns promptly
+after enqueueing the latest high-water mark and surfaces advice completed by the
+background worker at the next safe tool boundary. `Stop` waits for the final
 high-water mark, flushes deferred notes, and continues the task when terminal
 advice is a blocker.
 
@@ -53,15 +53,16 @@ hour without a connection. That server's read-tier inspection tools run without
 approval; its exec-tier tools retain `writes` approval mode and are routed
 through Codex Auto-review ("Approve for me"). The persistent app-server uses the
 current Codex login and is marked so the plugin cannot recursively advise itself.
-It runs in its own process group. A review timeout first interrupts the active
-turn, then terminates the complete app-server descendant tree if it does not
-settle; the devtools broker and its Node/LSP/DAP descendants are retired as part
-of that timeout recovery.
+It receives an isolated task-scoped `CODEX_HOME`, so user hooks, notifications,
+plugins, and unrelated MCP servers are not inherited. It runs in its own process
+group. A review timeout first interrupts the active turn, then terminates the
+complete app-server descendant tree if it does not settle; the devtools broker
+and its Node/LSP/DAP descendants are retired as part of that timeout recovery.
 
-Configuration, persistent advisor threads, and usage counters are stored under
-`$CODEX_HOME/plugin-data/advisor` (normally `~/.codex/plugin-data/advisor`) so
-they survive cache-busted plugin reinstalls. `PLUGIN_DATA` remains an explicit
-override for testing or custom installations.
+Installed plugins store configuration, persistent advisor threads, and usage
+counters in their Codex-provided `PLUGIN_DATA` directory (normally
+`$CODEX_HOME/plugins/data/advisor-<marketplace>`), so they survive cache-busted
+reinstalls. Direct source execution falls back to `$CODEX_HOME/plugin-data/advisor`.
 
 ## Data flow
 
@@ -72,8 +73,9 @@ review work in progress. The local MCP tools are read-only, but their requested
 file contents are likewise model-visible. Do not enable the plugin for tasks
 whose contents should not be sent to the configured model.
 
-Codex hooks provide safe-point async context injection rather than Oh My Pi's
-native token-stream steering. That is the unavoidable host adapter boundary;
+Codex provides background review with synchronous safe-point context injection
+rather than Oh My Pi's native token-stream steering. That is the unavoidable
+host adapter boundary;
 the singleton runtime, ordered coalescing queue, persistent context, prompt,
 advice formatting, WIP deferral, final blocker continuation, and noise/dedup
 guards are implemented locally.

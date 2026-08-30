@@ -20,7 +20,6 @@ from advisor_common import (  # noqa: E402
     start_update,
 )
 from advisor_hook import (  # noqa: E402
-    claim_delivery_waiter,
     complete_transcript_cursor,
     enqueue_update,
     ensure_worker,
@@ -85,14 +84,6 @@ class SingletonQueueTests(unittest.TestCase):
                 self.assertEqual(ensure_worker(session), 4242)
             popen.assert_not_called()
 
-    def test_delivery_waiter_is_singleton(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            session = Path(directory)
-            self.assertTrue(claim_delivery_waiter(session, 60))
-            with patch("advisor_hook.os.getpid", return_value=os.getpid() + 1):
-                self.assertFalse(claim_delivery_waiter(session, 60))
-
-
 class DeliveryVisibilityTests(unittest.TestCase):
     def test_completed_advice_is_drained_exactly_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -129,6 +120,12 @@ class DeliveryVisibilityTests(unittest.TestCase):
         handler = hooks["hooks"]["SessionEnd"][0]["hooks"][0]
         self.assertEqual(handler["timeout"], 3)
 
+    def test_post_tool_use_is_a_fast_synchronous_delivery_checkpoint(self) -> None:
+        hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        handler = hooks["hooks"]["PostToolUse"][0]["hooks"][0]
+        self.assertNotIn("async", handler)
+        self.assertEqual(handler["timeout"], 30)
+
     def test_runtime_contains_no_per_update_codex_exec(self) -> None:
         hook_source = (ROOT / "scripts" / "advisor_hook.py").read_text(encoding="utf-8")
         worker_source = (ROOT / "scripts" / "advisor_worker.py").read_text(encoding="utf-8")
@@ -136,22 +133,12 @@ class DeliveryVisibilityTests(unittest.TestCase):
         self.assertNotIn('"codex", "exec"', worker_source)
         self.assertIn('"codex", "app-server"', worker_source)
 
-    def test_app_server_disables_inherited_mcp_servers(self) -> None:
+    def test_app_server_only_configures_explicit_advisor_servers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            codex_home = root / ".codex"
-            codex_home.mkdir()
-            (codex_home / "config.toml").write_text(
-                '[mcp_servers.godot]\ncommand = "godot"\n'
-                '[mcp_servers.godot-rust-devtools]\ncommand = "node"\n'
-                '[mcp_servers."search.example"]\ncommand = "search"\n',
-                encoding="utf-8",
-            )
-            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
-                command = app_server_command(root / "session", root, root / "active.json", False)
-        self.assertIn("mcp_servers.godot.enabled=false", command)
-        self.assertIn("mcp_servers.godot-rust-devtools.enabled=false", command)
-        self.assertIn('mcp_servers."search.example".enabled=false', command)
+            command = app_server_command(root / "session", root, root / "active.json", False)
+        self.assertFalse(any(value.startswith("mcp_servers.godot.enabled=") for value in command))
+        self.assertFalse(any(value.startswith("mcp_servers.linear.enabled=") for value in command))
         self.assertTrue(any(value.startswith("mcp_servers.advisor.command=") for value in command))
 
 
