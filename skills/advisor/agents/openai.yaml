@@ -1,0 +1,4 @@
+interface:
+  display_name: "Advisor"
+  short_description: "Control the Oh My Pi-style Advisor"
+  default_prompt: "$advisor"

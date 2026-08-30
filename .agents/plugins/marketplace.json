@@ -1,0 +1,20 @@
+{
+  "name": "advisor",
+  "interface": {
+    "displayName": "Advisor"
+  },
+  "plugins": [
+    {
+      "name": "advisor",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

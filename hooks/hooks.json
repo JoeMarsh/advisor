@@ -1,0 +1,80 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/advisor_prompt_submit.py\"",
+            "commandWindows": "cmd.exe /d /s /c %PLUGIN_ROOT%\\scripts\\advisor_python.cmd advisor_prompt_submit.py",
+            "timeout": 30,
+            "statusMessage": "Applying Advisor control"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/advisor_hook.py\"",
+            "commandWindows": "cmd.exe /d /s /c %PLUGIN_ROOT%\\scripts\\advisor_python.cmd advisor_hook.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/advisor_hook.py\"",
+            "commandWindows": "cmd.exe /d /s /c %PLUGIN_ROOT%\\scripts\\advisor_python.cmd advisor_hook.py",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/advisor_hook.py\"",
+            "commandWindows": "cmd.exe /d /s /c %PLUGIN_ROOT%\\scripts\\advisor_python.cmd advisor_hook.py",
+            "timeout": 600,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/advisor_hook.py\"",
+            "commandWindows": "cmd.exe /d /s /c %PLUGIN_ROOT%\\scripts\\advisor_python.cmd advisor_hook.py",
+            "timeout": 15,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/advisor_hook.py\"",
+            "commandWindows": "cmd.exe /d /s /c %PLUGIN_ROOT%\\scripts\\advisor_python.cmd advisor_hook.py",
+            "timeout": 600
+          }
+        ]
+      }
+    ]
+  }
+}

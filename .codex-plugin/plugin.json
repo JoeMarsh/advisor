@@ -1,0 +1,36 @@
+{
+  "name": "advisor",
+  "version": "0.1.0+codex.20260830115723",
+  "description": "A concurrent, mid-task advisor modeled closely on Oh My Pi's advisor runtime.",
+  "author": {
+    "name": "Oh My Pi contributors and JoeMarsh"
+  },
+  "homepage": "https://github.com/JoeMarsh/advisor",
+  "repository": "https://github.com/JoeMarsh/advisor",
+  "license": "MIT",
+  "keywords": [
+    "advisor",
+    "hooks",
+    "review",
+    "oh-my-pi"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Advisor",
+    "shortDescription": "Concurrent mid-task advice from Luna.",
+    "longDescription": "Runs a persistent read-only advisor concurrently after tool use, injects timely advice at safe points, and performs a final Stop review.",
+    "developerName": "JoeMarsh",
+    "category": "Productivity",
+    "capabilities": [
+      "Hooks",
+      "Read-only",
+      "Interactive"
+    ],
+    "websiteURL": "https://github.com/JoeMarsh/advisor",
+    "defaultPrompt": [
+      "$advisor",
+      "$advisor status",
+      "$advisor usage"
+    ]
+  }
+}

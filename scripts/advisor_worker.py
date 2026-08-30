@@ -1,0 +1,611 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+import uuid
+from pathlib import Path
+from typing import Any
+
+from advisor_common import (
+    FileLock,
+    append_delivery,
+    empty_token_usage,
+    flush_deferred,
+    load_config,
+    load_json,
+    normalize_token_usage,
+    read_update_result,
+    record_advisor_invocation,
+    save_json,
+    start_update,
+    token_usage_delta,
+    update_had_advice,
+)
+from advisor_devtools_proxy import shutdown_broker
+from advisor_hook import build_system_prompt, log_error, mcp_overrides, read_transcript_delta, requested_advisor_tools
+from advisor_process import advisor_process_group_kwargs, terminate_process_tree
+
+
+def app_server_usage(value: Any) -> dict[str, int]:
+    source = value if isinstance(value, dict) else {}
+    return normalize_token_usage({
+        "input_tokens": source.get("inputTokens", source.get("input_tokens", 0)),
+        "cached_input_tokens": source.get("cachedInputTokens", source.get("cached_input_tokens", 0)),
+        "output_tokens": source.get("outputTokens", source.get("output_tokens", 0)),
+        "reasoning_output_tokens": source.get(
+            "reasoningOutputTokens", source.get("reasoning_output_tokens", 0)
+        ),
+        "total_tokens": source.get("totalTokens", source.get("total_tokens", 0)),
+    })
+
+
+class AppServerError(RuntimeError):
+    pass
+
+
+class AppServerTurnTimeout(TimeoutError):
+    pass
+
+
+class AppServerClient:
+    def __init__(self, command: list[str], cwd: Path, environment: dict[str, str], log_path: Path):
+        self.command = command
+        self.cwd = cwd
+        self.environment = environment
+        self.log_path = log_path
+        self.process: subprocess.Popen[str] | None = None
+        self.messages: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.request_id = 0
+        self.thread_id: str | None = None
+        self.latest_usage = empty_token_usage()
+        self.completed_items: list[dict[str, Any]] = []
+        self.last_turn: dict[str, Any] | None = None
+        self._reader: threading.Thread | None = None
+        self._stderr_reader: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.process = subprocess.Popen(
+            self.command,
+            cwd=self.cwd,
+            env=self.environment,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=1,
+            **advisor_process_group_kwargs(),
+        )
+        self._reader = threading.Thread(target=self._read_stdout, name="advisor-app-server-out", daemon=True)
+        self._stderr_reader = threading.Thread(
+            target=self._read_stderr, name="advisor-app-server-err", daemon=True
+        )
+        self._reader.start()
+        self._stderr_reader.start()
+        response = self.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "codex_advisor",
+                    "title": "Codex Advisor",
+                    "version": "0.1.0",
+                },
+                "capabilities": {
+                    "optOutNotificationMethods": ["item/agentMessage/delta"],
+                },
+            },
+            timeout=30,
+        )
+        if "result" not in response:
+            raise AppServerError(f"app-server initialize failed: {response}")
+        self.notify("initialized", {})
+
+    def _append_log(self, text: str) -> None:
+        try:
+            with self.log_path.open("a", encoding="utf-8") as stream:
+                stream.write(text.rstrip() + "\n")
+        except OSError:
+            pass
+
+    def _read_stdout(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        for line in self.process.stdout:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                self._append_log(f"app-server non-JSON stdout: {line.rstrip()}")
+                continue
+            if isinstance(message, dict):
+                self.messages.put(message)
+
+    def _read_stderr(self) -> None:
+        assert self.process is not None and self.process.stderr is not None
+        for line in self.process.stderr:
+            self._append_log(f"app-server stderr: {line.rstrip()}")
+
+    def _send(self, message: dict[str, Any]) -> None:
+        if self.process is None or self.process.poll() is not None or self.process.stdin is None:
+            raise AppServerError("app-server is not running")
+        self.process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+        self.process.stdin.flush()
+
+    def notify(self, method: str, params: dict[str, Any]) -> None:
+        self._send({"method": method, "params": params})
+
+    def _next_id(self) -> int:
+        self.request_id += 1
+        return self.request_id
+
+    def _handle_server_request(self, message: dict[str, Any]) -> bool:
+        if "id" not in message or "method" not in message:
+            return False
+        method = str(message.get("method"))
+        if method in {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        }:
+            warning = (
+                f"Advisor requested an interactive approval through {method} after Auto-review; "
+                "the headless advisor client declined it."
+            )
+            self._append_log(warning)
+            append_delivery(self.log_path.parent, warning=warning)
+            self._send({"id": message["id"], "result": {"decision": "decline"}})
+        elif method == "item/permissions/requestApproval":
+            warning = (
+                "Advisor requested interactive permissions after Auto-review; "
+                "the headless advisor client granted none."
+            )
+            self._append_log(warning)
+            append_delivery(self.log_path.parent, warning=warning)
+            self._send({"id": message["id"], "result": {"permissions": {}, "scope": "turn"}})
+        else:
+            self._send({
+                "id": message["id"],
+                "error": {"code": -32601, "message": f"Advisor client cannot service {method}"},
+            })
+        return True
+
+    def _observe(self, message: dict[str, Any]) -> None:
+        if message.get("method") == "thread/tokenUsage/updated":
+            params = message.get("params", {})
+            token_usage = params.get("tokenUsage", {}) if isinstance(params, dict) else {}
+            if isinstance(token_usage, dict):
+                self.latest_usage = app_server_usage(token_usage.get("total"))
+        elif message.get("method") == "item/completed":
+            params = message.get("params", {})
+            item = params.get("item") if isinstance(params, dict) else None
+            if isinstance(item, dict):
+                self.completed_items.append(item)
+        elif message.get("method") == "turn/completed":
+            params = message.get("params", {})
+            turn = params.get("turn") if isinstance(params, dict) else None
+            if isinstance(turn, dict):
+                self.last_turn = turn
+
+    def request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+        request_id = self._next_id()
+        self._send({"method": method, "id": request_id, "params": params})
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AppServerTurnTimeout(f"timed out waiting for {method}")
+            try:
+                message = self.messages.get(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                if self.process is None or self.process.poll() is not None:
+                    raise AppServerError(f"app-server exited while waiting for {method}")
+                continue
+            self._observe(message)
+            if self._handle_server_request(message):
+                continue
+            if message.get("id") == request_id:
+                if message.get("error"):
+                    raise AppServerError(f"{method} failed: {message['error']}")
+                return message
+
+    def open_thread(
+        self,
+        stored_thread_id: str | None,
+        model: str,
+        reasoning: str,
+        cwd: Path,
+        instructions: str,
+    ) -> str:
+        common = {
+            "model": model,
+            "cwd": str(cwd),
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
+            "sandbox": "read-only",
+            "baseInstructions": instructions,
+            "config": {"model_reasoning_effort": reasoning},
+        }
+        if stored_thread_id:
+            try:
+                response = self.request(
+                    "thread/resume", {"threadId": stored_thread_id, **common}, timeout=60
+                )
+            except AppServerError:
+                stored_thread_id = None
+        if not stored_thread_id:
+            response = self.request(
+                "thread/start",
+                {**common, "ephemeral": False, "serviceName": "codex_advisor"},
+                timeout=60,
+            )
+        thread = response.get("result", {}).get("thread", {})
+        thread_id = thread.get("id") if isinstance(thread, dict) else None
+        if not isinstance(thread_id, str) or not thread_id:
+            raise AppServerError(f"thread open returned no id: {response}")
+        self.thread_id = thread_id
+        return thread_id
+
+    def run_turn(self, update: str, reasoning: str, timeout: float) -> dict[str, int]:
+        if not self.thread_id:
+            raise AppServerError("advisor thread is not open")
+        before = self.latest_usage
+        request_id = self._next_id()
+        self._send({
+            "method": "turn/start",
+            "id": request_id,
+            "params": {
+                "threadId": self.thread_id,
+                "input": [{"type": "text", "text": update}],
+                "effort": reasoning,
+                "approvalPolicy": "on-request",
+                "sandboxPolicy": {"type": "readOnly", "access": {"type": "fullAccess"}},
+            },
+        })
+        deadline = time.monotonic() + timeout
+        turn_id: str | None = None
+        interrupted = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if turn_id and not interrupted:
+                    interrupted = True
+                    self._send({
+                        "method": "turn/interrupt",
+                        "id": self._next_id(),
+                        "params": {"threadId": self.thread_id, "turnId": turn_id},
+                    })
+                    deadline = time.monotonic() + 5
+                    continue
+                raise AppServerTurnTimeout("advisor turn timed out")
+            try:
+                message = self.messages.get(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                if self.process is None or self.process.poll() is not None:
+                    raise AppServerError("app-server exited during advisor turn")
+                continue
+            self._observe(message)
+            if self._handle_server_request(message):
+                continue
+            if message.get("id") == request_id:
+                result_turn = message.get("result", {}).get("turn", {})
+                if message.get("error"):
+                    raise AppServerError(f"turn/start failed: {message['error']}")
+                if isinstance(result_turn, dict):
+                    turn_id = result_turn.get("id") or turn_id
+                continue
+            if message.get("method") != "turn/completed":
+                continue
+            params = message.get("params", {})
+            completed_turn = params.get("turn", {}) if isinstance(params, dict) else {}
+            completed_id = completed_turn.get("id") if isinstance(completed_turn, dict) else None
+            if turn_id and completed_id and completed_id != turn_id:
+                continue
+            status = completed_turn.get("status") if isinstance(completed_turn, dict) else None
+            if status not in {"completed", "Completed"}:
+                raise AppServerError(f"advisor turn ended with status {status}: {completed_turn}")
+            return token_usage_delta(self.latest_usage, before)
+
+    def close(self) -> None:
+        if self.process is None:
+            return
+        process = self.process
+        self.process = None
+        terminate_process_tree(process)
+
+
+def queue_path(session: Path) -> Path:
+    return session / "queue.json"
+
+
+def worker_path(session: Path) -> Path:
+    return session / "worker.json"
+
+
+def runtime_path(session: Path) -> Path:
+    return session / "runtime.json"
+
+
+def update_worker_state(session: Path, **values: Any) -> None:
+    with FileLock(session / "worker-state.lock", timeout=10, stale_after=30):
+        state = load_json(worker_path(session), {})
+        if not isinstance(state, dict):
+            state = {}
+        state.update(values)
+        state["heartbeat"] = time.time()
+        save_json(worker_path(session), state)
+
+
+def app_server_command(session: Path, cwd: Path, runtime_file: Path, allow_shell: bool) -> list[str]:
+    command = ["codex", "app-server", "--stdio"]
+    overrides = [
+        "features.apps=false",
+        "features.goals=false",
+        "features.hooks=false",
+        "features.multi_agent=false",
+        "features.plugins=false",
+        "features.remote_plugin=false",
+        "features.plugin_sharing=false",
+        f"features.shell_tool={'true' if allow_shell else 'false'}",
+        "tools.view_image=false",
+        'web_search="disabled"',
+    ]
+    requested = requested_advisor_tools(cwd)
+    allowed_servers = {"advisor"}
+    if requested.intersection({"lsp", "debug"}):
+        allowed_servers.add("godot-rust-devtools")
+    for server_name in configured_mcp_server_names(cwd):
+        if server_name not in allowed_servers:
+            segment = server_name if re.fullmatch(r"[A-Za-z0-9_-]+", server_name) else json.dumps(server_name)
+            overrides.append(f"mcp_servers.{segment}.enabled=false")
+    overrides.extend(mcp_overrides(session, cwd, runtime_file=runtime_file))
+    for override in overrides:
+        command.extend(["-c", override])
+    return command
+
+
+def configured_mcp_server_names(cwd: Path) -> set[str]:
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    candidates = [codex_home / "config.toml"]
+    candidates.extend(base / ".codex" / "config.toml" for base in reversed([cwd, *cwd.parents]))
+    names: set[str] = set()
+    seen: set[str] = set()
+    for path in candidates:
+        key = os.path.normcase(str(path.resolve()))
+        if key in seen or not path.is_file():
+            continue
+        seen.add(key)
+        try:
+            document = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            continue
+        servers = document.get("mcp_servers")
+        if isinstance(servers, dict):
+            names.update(str(name) for name in servers)
+    return names
+
+
+class AdvisorWorker:
+    def __init__(self, session: Path):
+        self.session = session
+        self.app: AppServerClient | None = None
+        self.app_key: tuple[str, str, tuple[str, ...], str] | None = None
+        self.stopping = False
+
+    def close_app(self, retire_devtools: bool = False) -> None:
+        if self.app is not None:
+            self.app.close()
+            self.app = None
+        self.app_key = None
+        if retire_devtools:
+            shutdown_broker(self.session / "devtools-broker.json")
+
+    def ensure_app(self, cwd: Path, config: dict[str, Any], system_prompt: str) -> AppServerClient:
+        tools = tuple(sorted(requested_advisor_tools(cwd)))
+        key = (str(config["model"]), str(config["reasoning_effort"]), tools, system_prompt)
+        if self.app is not None and self.app_key == key:
+            return self.app
+        self.close_app()
+        active_file = self.session / "active-update.json"
+        command = app_server_command(self.session, cwd, active_file, "bash" in tools)
+        environment = os.environ.copy()
+        environment["CODEX_ADVISOR_NESTED"] = "1"
+        app = AppServerClient(command, cwd, environment, self.session / "advisor.log")
+        app.start()
+        runtime = load_json(runtime_path(self.session), {})
+        stored_thread = runtime.get("thread_id") if isinstance(runtime, dict) else None
+        stored_usage = runtime.get("advisor_thread_usage") if isinstance(runtime, dict) else None
+        if stored_thread and isinstance(stored_usage, dict):
+            app.latest_usage = normalize_token_usage(stored_usage)
+        thread_id = app.open_thread(
+            stored_thread if isinstance(stored_thread, str) else None,
+            str(config["model"]),
+            str(config["reasoning_effort"]),
+            cwd,
+            system_prompt,
+        )
+        if not isinstance(runtime, dict):
+            runtime = {}
+        runtime["thread_id"] = thread_id
+        runtime["advisor_thread_usage"] = app.latest_usage
+        save_json(runtime_path(self.session), runtime)
+        self.app = app
+        self.app_key = key
+        update_worker_state(self.session, app_server_pid=app.process.pid if app.process else None)
+        return app
+
+    def process_batch(self, state: dict[str, Any]) -> None:
+        transcript_raw = state.get("transcript")
+        cwd_raw = state.get("cwd")
+        if not transcript_raw or not cwd_raw:
+            return
+        transcript = Path(str(transcript_raw))
+        cwd = Path(str(cwd_raw)).resolve()
+        processed_cursor = int(state.get("processed_cursor", 0))
+        delta, new_cursor = read_transcript_delta(transcript, processed_cursor)
+        generation = int(state.get("generation", 0))
+        in_progress = str(state.get("latest_event")) != "Stop"
+        if not delta:
+            if not in_progress:
+                update_id = uuid.uuid4().hex
+                start_update(self.session, update_id)
+                flush_deferred(self.session, update_id)
+                append_delivery(
+                    self.session,
+                    notes=read_update_result(self.session, update_id),
+                    update_id=update_id,
+                )
+            self.finish_batch(generation, new_cursor, None)
+            return
+
+        update_id = uuid.uuid4().hex
+        start_update(self.session, update_id)
+        save_json(self.session / "active-update.json", {
+            "update_id": update_id,
+            "in_progress": in_progress,
+            "generation": generation,
+            "cursor": new_cursor,
+        })
+        update = "### Session update\n\n" + delta
+        if in_progress:
+            update += "\n\n---\n\n[in progress — more steps follow]"
+        config = load_config()
+        system_prompt = build_system_prompt(cwd)
+        final_error: Exception | None = None
+        succeeded = False
+        usage = empty_token_usage()
+        review_deadline = time.monotonic() + float(config.get("timeout_seconds", 300))
+        for attempt in range(1, 4):
+            remaining = review_deadline - time.monotonic()
+            if remaining <= 0:
+                final_error = AppServerTurnTimeout("advisor batch exhausted its total timeout")
+                break
+            try:
+                app = self.ensure_app(cwd, config, system_prompt)
+                usage = app.run_turn(
+                    update,
+                    str(config["reasoning_effort"]),
+                    remaining,
+                )
+                runtime = load_json(runtime_path(self.session), {})
+                if not isinstance(runtime, dict):
+                    runtime = {}
+                runtime["thread_id"] = app.thread_id
+                runtime["advisor_thread_usage"] = app.latest_usage
+                save_json(runtime_path(self.session), runtime)
+                succeeded = True
+                final_error = None
+                break
+            except (AppServerError, AppServerTurnTimeout, OSError) as error:
+                final_error = error
+                log_error(self.session, f"persistent advisor attempt {attempt}/3 failed: {error}")
+                self.close_app(retire_devtools=isinstance(error, AppServerTurnTimeout))
+                runtime = load_json(runtime_path(self.session), {})
+                if not isinstance(runtime, dict):
+                    runtime = {}
+                runtime["thread_id"] = None
+                save_json(runtime_path(self.session), runtime)
+                if attempt < 3 and review_deadline - time.monotonic() > attempt:
+                    time.sleep(attempt)
+
+        record_advisor_invocation(
+            self.session,
+            usage,
+            succeeded,
+            update_had_advice(self.session, update_id),
+            config,
+        )
+        if not succeeded:
+            append_delivery(
+                self.session,
+                warning=(
+                    "Advisor unavailable after three persistent-worker attempts; "
+                    f"this transcript batch was dropped. {final_error}"
+                ),
+                update_id=update_id,
+            )
+        if not in_progress:
+            flush_deferred(self.session, update_id)
+        notes = read_update_result(self.session, update_id)
+        append_delivery(self.session, notes=notes, update_id=update_id)
+        self.finish_batch(generation, new_cursor, str(final_error) if final_error else None)
+
+    def finish_batch(self, generation: int, cursor: int, error: str | None) -> None:
+        with FileLock(self.session / "queue.lock", timeout=10, stale_after=30):
+            state = load_json(queue_path(self.session), {})
+            if not isinstance(state, dict):
+                state = {}
+            state["processed_cursor"] = max(int(state.get("processed_cursor", 0)), cursor)
+            state["processed_generation"] = max(int(state.get("processed_generation", 0)), generation)
+            state["last_error"] = error
+            state["last_completed_at"] = time.time()
+            save_json(queue_path(self.session), state)
+
+    def run(self) -> int:
+        update_worker_state(
+            self.session,
+            pid=os.getpid(),
+            status="running",
+            started_at=time.time(),
+            app_server_pid=None,
+        )
+        last_work = time.monotonic()
+        try:
+            while not self.stopping:
+                config = load_config()
+                if not config.get("enabled", True):
+                    break
+                with FileLock(self.session / "queue.lock", timeout=10, stale_after=30):
+                    state = load_json(queue_path(self.session), {})
+                if not isinstance(state, dict):
+                    state = {}
+                if state.get("shutdown"):
+                    break
+                desired = int(state.get("desired_cursor", 0))
+                processed = int(state.get("processed_cursor", 0))
+                generation = int(state.get("generation", 0))
+                processed_generation = int(state.get("processed_generation", 0))
+                needs_terminal_flush = (
+                    str(state.get("latest_event")) == "Stop"
+                    and generation > processed_generation
+                )
+                if desired > processed or needs_terminal_flush:
+                    coalesce = max(0, int(config.get("coalesce_milliseconds", 350))) / 1000.0
+                    if coalesce:
+                        time.sleep(coalesce)
+                    with FileLock(self.session / "queue.lock", timeout=10, stale_after=30):
+                        state = load_json(queue_path(self.session), state)
+                    update_worker_state(self.session, status="reviewing")
+                    self.process_batch(state)
+                    update_worker_state(self.session, status="running")
+                    last_work = time.monotonic()
+                    continue
+                if time.monotonic() - last_work >= float(config.get("worker_idle_seconds", 3600)):
+                    break
+                update_worker_state(self.session, status="idle")
+                time.sleep(0.25)
+        finally:
+            self.close_app(retire_devtools=True)
+            update_worker_state(
+                self.session,
+                status="stopped",
+                stopped_at=time.time(),
+                app_server_pid=None,
+            )
+        return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--session-dir", required=True)
+    options = parser.parse_args()
+    return AdvisorWorker(Path(options.session_dir).resolve()).run()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
