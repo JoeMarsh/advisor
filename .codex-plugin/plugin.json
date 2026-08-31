@@ -1,6 +1,6 @@
 {
   "name": "advisor",
-  "version": "0.1.0+codex.20260831211721",
+  "version": "0.1.0+codex.20260831212714",
   "description": "A concurrent, mid-task advisor modeled closely on Oh My Pi's advisor runtime.",
   "author": {
     "name": "Oh My Pi contributors and JoeMarsh"
@@ -15,6 +15,7 @@
     "oh-my-pi"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Advisor",
     "shortDescription": "Concurrent mid-task advice from Luna.",
