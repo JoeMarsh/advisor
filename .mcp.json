@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "advisor-feed": {
+      "command": "node",
+      "args": [
+        "scripts/advisor_feed_mcp.mjs"
+      ],
+      "cwd": ".",
+      "default_tools_approval_mode": "never"
+    }
+  }
+}

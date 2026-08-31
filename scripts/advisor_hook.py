@@ -400,7 +400,7 @@ def normalized_queue_state(value: Any) -> dict[str, Any]:
             for key in (
                 "transcript", "cwd", "desired_cursor", "processed_cursor",
                 "generation", "processed_generation", "latest_event",
-                "updated_at", "last_error", "last_completed_at",
+                "updated_at", "last_error", "last_completed_at", "is_root",
             )
         }
     return {
@@ -497,7 +497,7 @@ def stop_worker(session: Path, wait_seconds: float = 2.0) -> None:
     shutdown_broker(session / "devtools-broker.json")
 
 
-def reset_queue(session: Path, path: Path | None, cwd: Path) -> None:
+def reset_queue(session: Path, path: Path | None, cwd: Path, is_root: bool = False) -> None:
     cursor = complete_transcript_cursor(path)
     with FileLock(session / "queue.lock", timeout=10, stale_after=30):
         state = normalized_queue_state(load_json(queue_state_path(session), {}))
@@ -515,12 +515,19 @@ def reset_queue(session: Path, path: Path | None, cwd: Path) -> None:
                 "generation": generation,
                 "processed_generation": generation,
                 "latest_event": "SessionStart",
+                "is_root": is_root,
                 "updated_at": time.time(),
             }
         save_json(queue_state_path(session), state)
 
 
-def enqueue_update(session: Path, path: Path | None, cwd: Path, event: str) -> int:
+def enqueue_update(
+    session: Path,
+    path: Path | None,
+    cwd: Path,
+    event: str,
+    is_root: bool = False,
+) -> int:
     desired_cursor = complete_transcript_cursor(path)
     with FileLock(session / "queue.lock", timeout=10, stale_after=30):
         state = normalized_queue_state(load_json(queue_state_path(session), {}))
@@ -543,6 +550,7 @@ def enqueue_update(session: Path, path: Path | None, cwd: Path, event: str) -> i
             "desired_cursor": max(int(lane.get("desired_cursor", 0)), desired_cursor),
             "generation": generation,
             "latest_event": event,
+            "is_root": is_root,
             "updated_at": time.time(),
         })
         save_json(queue_state_path(session), state)
@@ -597,10 +605,8 @@ def hook_output(
             output["hookSpecificOutput"] = {
                 "hookEventName": "PostToolUse",
                 "additionalContext": (
-                    "Surface this Advisor feedback to the user now. In your next commentary "
-                    "message, write `Advisor (<severity>): <note>` for every advisory below, "
-                    "preserving each note verbatim. This is non-blocking feedback: after "
-                    "surfacing it, independently weigh it and continue the task.\n\n"
+                    "Advisor feedback for your own transcript follows. Independently weigh "
+                    "it and continue your work; do not copy it into another agent's context.\n\n"
                     + content
                 ),
             }
@@ -656,7 +662,7 @@ def main() -> int:
             if isinstance(runtime, dict):
                 runtime["thread_id"] = None
                 save_json(session / "runtime.json", runtime)
-        reset_queue(session, path, cwd)
+        reset_queue(session, path, cwd, root_transcript)
         ensure_worker(session)
         usage_state = load_usage_state(session)
         output = hook_output(
@@ -679,24 +685,32 @@ def main() -> int:
         if isinstance(runtime, dict):
             runtime["thread_id"] = None
             save_json(session / "runtime.json", runtime)
-        reset_queue(session, path, cwd)
+        reset_queue(session, path, cwd, root_transcript)
         ensure_worker(session)
         return 0
 
-    generation = enqueue_update(session, path, cwd, event)
+    generation = enqueue_update(session, path, cwd, event, root_transcript)
     ensure_worker(session)
 
-    notes, warnings = drain_deliveries(session) if root_transcript else ([], [])
+    lane_key = queue_lane_key(path)
+    notes, warnings = drain_deliveries(
+        session,
+        lane_key,
+        include_unscoped=root_transcript,
+    )
     if not notes and not warnings:
-        if event == "Stop" and root_transcript:
+        if event == "Stop":
             wait_for_generation(
                 session,
                 generation,
                 float(config.get("timeout_seconds", 300)) + 20,
-                queue_lane_key(path),
+                lane_key,
             )
-        if root_transcript:
-            notes, warnings = drain_deliveries(session)
+        notes, warnings = drain_deliveries(
+            session,
+            lane_key,
+            include_unscoped=root_transcript,
+        )
 
     if notes:
         usage_state = record_visible_advisories(session, notes)

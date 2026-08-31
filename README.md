@@ -34,18 +34,22 @@ independently scheduled hook processes cannot create parallel advisor runs,
 overwrite another agent's cursor, or recount its token usage. Each fast
 synchronous hook returns promptly
 after enqueueing the latest high-water mark and surfaces advice completed by the
-background worker at the next safe tool boundary. Only the root transcript
-drains completed deliveries, preventing subagent checkpoints from consuming
-feedback outside the main chat. Both ordinary advice and blockers are injected
-into the root agent's context with an instruction to echo the note verbatim in a
-commentary message, while `systemMessage` also supplies Codex's hook warning.
+background worker at the next safe tool boundary. Each root or subagent
+transcript drains only its own completed deliveries. Advice from subagent work
+therefore stays with that subagent and never consumes main-agent context. Both
+ordinary advice and blockers are injected into the originating agent's context,
+while `systemMessage` also supplies Codex's hook warning for that same lane.
 `Stop` waits for the final high-water mark and continues the task when terminal
 advice is a blocker.
 
-Every delivered advisory is also emitted as a visible hook warning. A compact
-footer compares exact model-processed token usage for the main task and advisor,
-including cached input and the advisor's share of their combined usage. Silent
-reviews remain silent.
+Every advisory and runtime warning is additionally copied into a durable,
+read-only user feed without injecting it into another agent. `$advisor feed`
+opens the plugin's auto-refreshing MCP App panel, showing root/subagent origin,
+severity, recent advice, worker state, and exact main-versus-Advisor token usage.
+The panel refreshes by calling a read-only local data tool directly, so refreshes
+do not add messages to the main agent's context. A compact hook footer still
+compares model-processed token usage for the current task. Silent reviews remain
+silent.
 
 The advisor runs with read-only sandboxing and always exposes `advise`, `read`,
 `grep`, and `glob` through a persistent local MCP server. When an applicable
@@ -94,7 +98,7 @@ guards are implemented locally.
 ## Controls
 
 Use the app's Advisor picker item or bare `$advisor` to toggle the advisor. Add
-`status`, `usage`, `on`, `off`, `reset`, or
+`status`, `usage`, `feed`, `on`, `off`, `reset`, or
 `$advisor model <model> <reasoning>`. Codex does not currently let a plugin add a
 native `/advisor` command, so `$advisor` and the picker item are the control
 surface. A synchronous prompt-submit adapter recognizes the app's serialized
@@ -105,6 +109,10 @@ cached and uncached input, output, reasoning output, main request count, advisor
 invocations, silent reviews, visible advisories, severity mix, and comparison
 ratios. These are token-processing counters, not unique transcript size or a
 currency estimate; reasoning output is already included in output tokens.
+
+`$advisor feed` opens the current task's live read-only feed. It is the oversight
+surface for subagent advice; the Advisor does not forward that advice to the
+main agent unless the main transcript independently receives the same finding.
 
 ## Attribution
 

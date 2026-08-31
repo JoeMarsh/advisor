@@ -89,6 +89,8 @@ class AppServerClient:
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
         self.progress_callback = progress_callback
+        self.delivery_transcript: str | None = None
+        self.delivery_is_root: bool | None = None
 
     def _progress(self) -> None:
         if self.progress_callback is not None:
@@ -181,7 +183,12 @@ class AppServerClient:
                 "the headless advisor client declined it."
             )
             self._append_log(warning)
-            append_delivery(self.log_path.parent, warning=warning)
+            append_delivery(
+                self.log_path.parent,
+                warning=warning,
+                transcript=self.delivery_transcript,
+                is_root=self.delivery_is_root,
+            )
             self._send({"id": message["id"], "result": {"decision": "decline"}})
         elif method == "item/permissions/requestApproval":
             warning = (
@@ -189,7 +196,12 @@ class AppServerClient:
                 "the headless advisor client granted none."
             )
             self._append_log(warning)
-            append_delivery(self.log_path.parent, warning=warning)
+            append_delivery(
+                self.log_path.parent,
+                warning=warning,
+                transcript=self.delivery_transcript,
+                is_root=self.delivery_is_root,
+            )
             self._send({"id": message["id"], "result": {"permissions": {}, "scope": "turn"}})
         else:
             self._send({
@@ -492,6 +504,8 @@ class AdvisorWorker:
         if not transcript_raw or not cwd_raw:
             return
         transcript = Path(str(transcript_raw))
+        transcript_key = lane_key or str(transcript.resolve())
+        is_root = bool(state.get("is_root", False))
         cwd = Path(str(cwd_raw)).resolve()
         processed_cursor = int(state.get("processed_cursor", 0))
         delta, new_cursor = read_transcript_delta(transcript, processed_cursor)
@@ -506,6 +520,8 @@ class AdvisorWorker:
                     self.session,
                     notes=read_update_result(self.session, update_id),
                     update_id=update_id,
+                    transcript=transcript_key,
+                    is_root=is_root,
                 )
             self.finish_batch(generation, new_cursor, None, lane_key)
             return
@@ -517,6 +533,8 @@ class AdvisorWorker:
             "in_progress": in_progress,
             "generation": generation,
             "cursor": new_cursor,
+            "transcript": transcript_key,
+            "is_root": is_root,
         })
         update = "### Session update\n\n" + delta
         if in_progress:
@@ -539,6 +557,8 @@ class AdvisorWorker:
             )
             try:
                 app = self.ensure_app(cwd, config, system_prompt)
+                app.delivery_transcript = transcript_key
+                app.delivery_is_root = is_root
                 usage = app.run_turn(
                     update,
                     str(config["reasoning_effort"]),
@@ -580,11 +600,19 @@ class AdvisorWorker:
                     f"this transcript batch was dropped. {final_error}"
                 ),
                 update_id=update_id,
+                transcript=transcript_key,
+                is_root=is_root,
             )
         if not in_progress:
             flush_deferred(self.session, update_id)
         notes = read_update_result(self.session, update_id)
-        append_delivery(self.session, notes=notes, update_id=update_id)
+        append_delivery(
+            self.session,
+            notes=notes,
+            update_id=update_id,
+            transcript=transcript_key,
+            is_root=is_root,
+        )
         self.finish_batch(generation, new_cursor, str(final_error) if final_error else None, lane_key)
 
     def finish_batch(
@@ -668,6 +696,8 @@ class AdvisorWorker:
                         append_delivery(
                             self.session,
                             warning=f"Advisor worker recovered from an unexpected batch failure: {error}",
+                            transcript=lane_key,
+                            is_root=bool(lane.get("is_root", False)),
                         )
                         update_worker_state(
                             self.session,

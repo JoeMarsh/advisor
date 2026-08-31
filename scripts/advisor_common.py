@@ -426,36 +426,112 @@ def _delivery_file(session: Path) -> Path:
     return session / "deliveries.json"
 
 
+def _feed_file(session: Path) -> Path:
+    return session / "feed.json"
+
+
+def _append_feed_event(
+    session: Path,
+    notes: list[dict[str, str]],
+    warning: str | None,
+    update_id: str,
+    transcript: str | None,
+    is_root: bool | None,
+) -> None:
+    with FileLock(session / "feed.lock", timeout=10, stale_after=30):
+        feed = load_json(_feed_file(session), [])
+        if not isinstance(feed, list):
+            feed = []
+        created_at = time.time()
+        origin = "root" if is_root else "subagent" if is_root is False else "runtime"
+        for index, note in enumerate(notes):
+            feed.append({
+                "id": f"{update_id}:note:{index}",
+                "update_id": update_id,
+                "kind": "advice",
+                "note": str(note.get("note") or ""),
+                "severity": str(note.get("severity") or "nit"),
+                "transcript": transcript,
+                "origin": origin,
+                "created_at": created_at,
+            })
+        if warning:
+            feed.append({
+                "id": f"{update_id}:warning",
+                "update_id": update_id,
+                "kind": "warning",
+                "note": warning,
+                "severity": "warning",
+                "transcript": transcript,
+                "origin": origin,
+                "created_at": created_at,
+            })
+        save_json(_feed_file(session), feed[-512:])
+
+
 def append_delivery(
     session: Path,
     notes: list[dict[str, str]] | None = None,
     warning: str | None = None,
     update_id: str | None = None,
+    transcript: str | None = None,
+    is_root: bool | None = None,
 ) -> None:
     if not notes and not warning:
         return
+    delivery_id = update_id or f"delivery-{time.time_ns()}"
+    clean_notes = [note for note in (notes or []) if isinstance(note, dict)]
+    clean_warning = warning.strip() if isinstance(warning, str) and warning.strip() else None
     with FileLock(session / "deliveries.lock", timeout=10, stale_after=30):
         deliveries = load_json(_delivery_file(session), [])
         if not isinstance(deliveries, list):
             deliveries = []
         deliveries.append({
-            "id": update_id or f"delivery-{time.time_ns()}",
-            "notes": [note for note in (notes or []) if isinstance(note, dict)],
-            "warning": warning,
+            "id": delivery_id,
+            "notes": clean_notes,
+            "warning": clean_warning,
+            "transcript": transcript,
+            "is_root": is_root,
             "created_at": time.time(),
         })
         save_json(_delivery_file(session), deliveries[-256:])
+    _append_feed_event(
+        session,
+        clean_notes,
+        clean_warning,
+        delivery_id,
+        transcript,
+        is_root,
+    )
 
 
-def drain_deliveries(session: Path) -> tuple[list[dict[str, str]], list[str]]:
+def drain_deliveries(
+    session: Path,
+    transcript: str | None = None,
+    include_unscoped: bool = True,
+) -> tuple[list[dict[str, str]], list[str]]:
     with FileLock(session / "deliveries.lock", timeout=10, stale_after=30):
         deliveries = load_json(_delivery_file(session), [])
         if not isinstance(deliveries, list):
             deliveries = []
-        save_json(_delivery_file(session), [])
+        if transcript is None:
+            selected = deliveries
+            retained: list[Any] = []
+        else:
+            selected = []
+            retained = []
+            for delivery in deliveries:
+                if not isinstance(delivery, dict):
+                    continue
+                delivery_transcript = delivery.get("transcript")
+                matches = delivery_transcript == transcript
+                if delivery_transcript is None and include_unscoped:
+                    matches = True
+                (selected if matches else retained).append(delivery)
+        save_json(_delivery_file(session), retained)
     notes: list[dict[str, str]] = []
     warnings: list[str] = []
-    for delivery in deliveries:
+    for delivery in selected:
         if not isinstance(delivery, dict):
             continue
         notes.extend(note for note in delivery.get("notes", []) if isinstance(note, dict))

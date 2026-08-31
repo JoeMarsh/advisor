@@ -19,6 +19,7 @@ Only if the hook did not execute, resolve the plugin root by walking two parents
 - `$advisor reset` -> `reset`
 - `$advisor dump` -> `dump`
 - `$advisor usage` -> `usage` (show the most recently active task's main/advisor token comparison)
+- `$advisor feed` -> call the `show_advisor_feed` tool from the `advisor-feed` MCP server for the current task. This opens a read-only, auto-refreshing feed; do not run `advisor_ctl.py`.
 - `$advisor model <model> [reasoning]` -> `configure --model <model> --reasoning <reasoning>`
 
-The default is `gpt-5.6-luna` with `max` reasoning. Explain that Codex plugins cannot register native slash commands; `$advisor` and the app's Advisor picker item are the plugin control surfaces. A newly installed or updated hook plugin is loaded in a new Codex task.
+The default is `gpt-5.6-luna` with `max` reasoning. Advice is routed only to the root or subagent transcript that produced it; never copy subagent advice into the root agent's context. The separate feed is the user oversight surface. Explain that Codex plugins cannot register native slash commands; `$advisor` and the app's Advisor picker item are the plugin control surfaces. A newly installed or updated hook or MCP plugin is loaded in a new Codex task.

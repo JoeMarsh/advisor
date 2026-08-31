@@ -1,6 +1,6 @@
 {
   "name": "advisor",
-  "version": "0.1.0+codex.20260831203833",
+  "version": "0.1.0+codex.20260831210752",
   "description": "A concurrent, mid-task advisor modeled closely on Oh My Pi's advisor runtime.",
   "author": {
     "name": "Oh My Pi contributors and JoeMarsh"
@@ -18,7 +18,7 @@
   "interface": {
     "displayName": "Advisor",
     "shortDescription": "Concurrent mid-task advice from Luna.",
-    "longDescription": "Runs a persistent read-only advisor concurrently after tool use, injects timely advice at safe points, and performs a final Stop review.",
+    "longDescription": "Runs a persistent read-only advisor concurrently, routes advice to its originating agent, and provides a separate live user feed with token usage.",
     "developerName": "JoeMarsh",
     "category": "Productivity",
     "capabilities": [
@@ -30,7 +30,8 @@
     "defaultPrompt": [
       "$advisor",
       "$advisor status",
-      "$advisor usage"
+      "$advisor usage",
+      "$advisor feed"
     ]
   }
 }

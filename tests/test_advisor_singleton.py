@@ -196,7 +196,7 @@ class SingletonQueueTests(unittest.TestCase):
         self.assertIsNone(state["app_server_pid"])
 
 class DeliveryVisibilityTests(unittest.TestCase):
-    def test_only_root_transcript_is_a_user_chat_delivery_checkpoint(self) -> None:
+    def test_root_transcript_is_identified_for_lane_metadata(self) -> None:
         session_id = "01a05930-9404-7e52-b355-f44fed18068e"
         payload = {"session_id": session_id}
         root = Path(f"rollout-2026-08-31T19-59-11-{session_id}.jsonl")
@@ -218,6 +218,46 @@ class DeliveryVisibilityTests(unittest.TestCase):
         self.assertEqual(first_warnings, [])
         self.assertEqual(second_notes, [])
         self.assertEqual(second_warnings, [])
+
+    def test_each_transcript_drains_only_its_own_advice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            root_lane = str((session / "root.jsonl").resolve())
+            child_lane = str((session / "child.jsonl").resolve())
+            append_delivery(
+                session,
+                notes=[{"note": "Root note.", "severity": "concern"}],
+                update_id="root-u",
+                transcript=root_lane,
+                is_root=True,
+            )
+            append_delivery(
+                session,
+                notes=[{"note": "Child note.", "severity": "blocker"}],
+                update_id="child-u",
+                transcript=child_lane,
+                is_root=False,
+            )
+            child_notes, _ = drain_deliveries(session, child_lane, include_unscoped=False)
+            root_notes, _ = drain_deliveries(session, root_lane, include_unscoped=True)
+        self.assertEqual([note["note"] for note in child_notes], ["Child note."])
+        self.assertEqual([note["note"] for note in root_notes], ["Root note."])
+
+    def test_feed_retains_advice_after_agent_delivery_is_consumed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            lane = str((session / "child.jsonl").resolve())
+            append_delivery(
+                session,
+                notes=[{"note": "Keep this visible to the user.", "severity": "concern"}],
+                update_id="child-u",
+                transcript=lane,
+                is_root=False,
+            )
+            drain_deliveries(session, lane, include_unscoped=False)
+            feed = json.loads((session / "feed.json").read_text(encoding="utf-8"))
+        self.assertEqual(feed[0]["origin"], "subagent")
+        self.assertEqual(feed[0]["note"], "Keep this visible to the user.")
 
     def test_stop_always_surfaces_usage_even_when_review_is_silent(self) -> None:
         output = hook_output("Stop", [], {}, "Advisor usage · Main 100 · Advisor 10")

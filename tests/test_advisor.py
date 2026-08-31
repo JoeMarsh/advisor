@@ -44,7 +44,7 @@ from advisor_worker import (  # noqa: E402
     app_server_environment,
     app_server_usage,
 )
-from advisor_prompt_submit import control_arguments, parse_advisor_invocation  # noqa: E402
+from advisor_prompt_submit import control_arguments, feed_hook_output, parse_advisor_invocation  # noqa: E402
 
 
 class AdvisorCommonTests(unittest.TestCase):
@@ -483,7 +483,7 @@ class McpBridgeTests(unittest.TestCase):
         self.assertNotIn("decision", second)
         self.assertIn("systemMessage", second)
 
-    def test_mid_task_advice_is_model_visible_and_user_visible(self) -> None:
+    def test_mid_task_advice_is_visible_to_its_originating_agent_without_forced_echo(self) -> None:
         output = hook_output(
             "PostToolUse",
             [{"note": "Inspect the failed assertion.", "severity": "concern"}],
@@ -493,9 +493,15 @@ class McpBridgeTests(unittest.TestCase):
         content = output["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Advisor usage", output["systemMessage"])
         self.assertNotIn("Advisor usage", content)
-        self.assertIn("Surface this Advisor feedback to the user now", content)
-        self.assertIn("preserving each note verbatim", content)
+        self.assertIn("your own transcript", content)
+        self.assertIn("do not copy it into another agent's context", content)
         self.assertIn("Inspect the failed assertion.", content)
+
+    def test_feed_control_targets_current_session(self) -> None:
+        output = feed_hook_output("01a-test")
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("show_advisor_feed", context)
+        self.assertIn("session_id: 01a-test", context)
 
 
 if __name__ == "__main__":

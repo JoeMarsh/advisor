@@ -48,7 +48,7 @@ def control_arguments(remainder: str) -> tuple[list[str] | None, str | None]:
         return arguments, None
     return None, (
         "Unknown Advisor command. Use /advisor to toggle, or add on, off, status, "
-        "dump, usage, reset, or model <model> [reasoning]."
+        "dump, usage, feed, reset, or model <model> [reasoning]."
     )
 
 
@@ -66,6 +66,21 @@ def hook_output(result: str) -> dict[str, Any]:
     }
 
 
+def feed_hook_output(session_id: str) -> dict[str, Any]:
+    return {
+        "systemMessage": "Opening the read-only Advisor feed.",
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": (
+                "The user requested the Advisor feed. Call the `show_advisor_feed` tool from "
+                "the `advisor-feed` MCP server with the session_id below, then reply only with "
+                "a concise confirmation. Do not run advisor_ctl.py or do unrelated work.\n\n"
+                f"session_id: {session_id}"
+            ),
+        },
+    }
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -78,6 +93,16 @@ def main() -> int:
         return 0
     remainder = parse_advisor_invocation(prompt)
     if remainder is None:
+        return 0
+    if remainder.strip().lower() == "feed":
+        session_id = str(
+            payload.get("session_id")
+            or payload.get("sessionId")
+            or payload.get("thread_id")
+            or ""
+        )
+        json.dump(feed_hook_output(session_id), sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
         return 0
     arguments, error = control_arguments(remainder)
     if error:
