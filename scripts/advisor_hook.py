@@ -373,6 +373,37 @@ def queue_state_path(session: Path) -> Path:
     return session / "queue.json"
 
 
+def queue_lane_key(path: Path | None) -> str | None:
+    return str(path.resolve()) if path else None
+
+
+def normalized_queue_state(value: Any) -> dict[str, Any]:
+    state = value if isinstance(value, dict) else {}
+    lanes = state.get("lanes")
+    if isinstance(lanes, dict):
+        state.setdefault("generation", 0)
+        state.setdefault("shutdown", False)
+        return state
+
+    lanes = {}
+    transcript = state.get("transcript")
+    if transcript:
+        lanes[str(transcript)] = {
+            key: state.get(key)
+            for key in (
+                "transcript", "cwd", "desired_cursor", "processed_cursor",
+                "generation", "processed_generation", "latest_event",
+                "updated_at", "last_error", "last_completed_at",
+            )
+        }
+    return {
+        "generation": int(state.get("generation", 0) or 0),
+        "shutdown": bool(state.get("shutdown", False)),
+        "updated_at": state.get("updated_at"),
+        "lanes": lanes,
+    }
+
+
 def live_worker_pid(session: Path) -> int | None:
     with FileLock(session / "worker-state.lock", timeout=10, stale_after=30):
         state = load_json(worker_state_path(session), {})
@@ -445,9 +476,7 @@ def ensure_worker(session: Path) -> int:
 
 def stop_worker(session: Path, wait_seconds: float = 2.0) -> None:
     with FileLock(session / "queue.lock", timeout=10, stale_after=30):
-        state = load_json(queue_state_path(session), {})
-        if not isinstance(state, dict):
-            state = {}
+        state = normalized_queue_state(load_json(queue_state_path(session), {}))
         state["shutdown"] = True
         state["generation"] = int(state.get("generation", 0)) + 1
         save_json(queue_state_path(session), state)
@@ -464,53 +493,78 @@ def stop_worker(session: Path, wait_seconds: float = 2.0) -> None:
 def reset_queue(session: Path, path: Path | None, cwd: Path) -> None:
     cursor = complete_transcript_cursor(path)
     with FileLock(session / "queue.lock", timeout=10, stale_after=30):
-        previous = load_json(queue_state_path(session), {})
-        generation = int(previous.get("generation", 0)) + 1 if isinstance(previous, dict) else 1
-        save_json(queue_state_path(session), {
-            "transcript": str(path) if path else None,
-            "cwd": str(cwd),
-            "desired_cursor": cursor,
-            "processed_cursor": cursor,
-            "generation": generation,
-            "processed_generation": generation,
-            "latest_event": "SessionStart",
-            "shutdown": False,
-            "updated_at": time.time(),
-        })
+        state = normalized_queue_state(load_json(queue_state_path(session), {}))
+        generation = int(state.get("generation", 0)) + 1
+        state["generation"] = generation
+        state["shutdown"] = False
+        state["updated_at"] = time.time()
+        lane_key = queue_lane_key(path)
+        if lane_key is not None:
+            state["lanes"][lane_key] = {
+                "transcript": lane_key,
+                "cwd": str(cwd),
+                "desired_cursor": cursor,
+                "processed_cursor": cursor,
+                "generation": generation,
+                "processed_generation": generation,
+                "latest_event": "SessionStart",
+                "updated_at": time.time(),
+            }
+        save_json(queue_state_path(session), state)
 
 
 def enqueue_update(session: Path, path: Path | None, cwd: Path, event: str) -> int:
     desired_cursor = complete_transcript_cursor(path)
     with FileLock(session / "queue.lock", timeout=10, stale_after=30):
-        state = load_json(queue_state_path(session), {})
-        if not isinstance(state, dict):
-            state = {}
-        transcript_key = str(path) if path else None
-        if state.get("transcript") != transcript_key:
-            state = {
-                "processed_cursor": 0,
-                "processed_generation": 0,
-                "generation": int(state.get("generation", 0)),
-            }
+        state = normalized_queue_state(load_json(queue_state_path(session), {}))
+        transcript_key = queue_lane_key(path)
         generation = int(state.get("generation", 0)) + 1
-        state.update({
+        state["generation"] = generation
+        state["shutdown"] = False
+        state["updated_at"] = time.time()
+        if transcript_key is None:
+            save_json(queue_state_path(session), state)
+            return generation
+        lane = state["lanes"].setdefault(transcript_key, {
+            "processed_cursor": 0,
+            "processed_generation": 0,
+            "desired_cursor": 0,
+        })
+        lane.update({
             "transcript": transcript_key,
             "cwd": str(cwd),
-            "desired_cursor": max(int(state.get("desired_cursor", 0)), desired_cursor),
+            "desired_cursor": max(int(lane.get("desired_cursor", 0)), desired_cursor),
             "generation": generation,
             "latest_event": event,
-            "shutdown": False,
             "updated_at": time.time(),
         })
         save_json(queue_state_path(session), state)
         return generation
 
 
-def wait_for_generation(session: Path, generation: int, timeout: float) -> None:
+def wait_for_generation(
+    session: Path,
+    generation: int,
+    timeout: float,
+    lane_key: str | None = None,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        state = load_json(queue_state_path(session), {})
-        if isinstance(state, dict) and int(state.get("processed_generation", 0)) >= generation:
+        state = normalized_queue_state(load_json(queue_state_path(session), {}))
+        lanes = state["lanes"]
+        if lane_key is not None:
+            lane = lanes.get(lane_key)
+            completed = (
+                isinstance(lane, dict)
+                and int(lane.get("processed_generation", 0) or 0) >= generation
+            )
+        else:
+            completed = any(
+                int(lane.get("processed_generation", 0) or 0) >= generation
+                for lane in lanes.values()
+                if isinstance(lane, dict)
+            )
+        if completed:
             return
         if live_worker_pid(session) is None:
             ensure_worker(session)
@@ -625,6 +679,7 @@ def main() -> int:
                 session,
                 generation,
                 float(config.get("timeout_seconds", 300)) + 20,
+                queue_lane_key(path),
             )
         notes, warnings = drain_deliveries(session)
 

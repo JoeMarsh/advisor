@@ -28,7 +28,14 @@ from advisor_common import (
     update_had_advice,
 )
 from advisor_devtools_proxy import shutdown_broker
-from advisor_hook import build_system_prompt, log_error, mcp_overrides, read_transcript_delta, requested_advisor_tools
+from advisor_hook import (
+    build_system_prompt,
+    log_error,
+    mcp_overrides,
+    normalized_queue_state,
+    read_transcript_delta,
+    requested_advisor_tools,
+)
 from advisor_process import advisor_process_group_kwargs, terminate_process_tree
 
 
@@ -49,19 +56,14 @@ class AppServerError(RuntimeError):
     pass
 
 
-class AppServerTurnTimeout(TimeoutError):
+class AppServerUnresponsive(AppServerError):
     pass
 
 
-TURN_INTERRUPT_GRACE_SECONDS = 5.0
+APP_SERVER_HEALTH_PROBE_IDLE_SECONDS = 30.0
+APP_SERVER_HEALTH_PROBE_TIMEOUT_SECONDS = 30.0
+MAX_MISSED_HEALTH_PROBES = 3
 MAX_REVIEW_ATTEMPTS = 3
-
-
-def attempt_timeout_budget(remaining: float, attempts_left: int) -> float:
-    attempts = max(1, attempts_left)
-    retry_backoff = sum(range(1, attempts))
-    reserved = TURN_INTERRUPT_GRACE_SECONDS * attempts + retry_backoff
-    return max(0.001, (remaining - reserved) / attempts)
 
 
 class AppServerClient:
@@ -221,7 +223,7 @@ class AppServerClient:
             self._progress()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise AppServerTurnTimeout(f"timed out waiting for {method}")
+                raise AppServerUnresponsive(f"timed out waiting for {method}")
             try:
                 message = self.messages.get(timeout=min(remaining, 1.0))
             except queue.Empty:
@@ -273,7 +275,7 @@ class AppServerClient:
         self.thread_id = thread_id
         return thread_id
 
-    def run_turn(self, update: str, reasoning: str, timeout: float) -> dict[str, int]:
+    def run_turn(self, update: str, reasoning: str) -> dict[str, int]:
         if not self.thread_id:
             raise AppServerError("advisor thread is not open")
         before = self.latest_usage
@@ -289,31 +291,56 @@ class AppServerClient:
                 "sandboxPolicy": {"type": "readOnly", "access": {"type": "fullAccess"}},
             },
         })
-        deadline = time.monotonic() + timeout
         turn_id: str | None = None
-        interrupted = False
+        last_protocol_activity = time.monotonic()
+        health_probe_id: int | None = None
+        health_probe_sent_at = 0.0
+        health_probe_ids: set[int] = set()
+        missed_health_probes = 0
         while True:
             self._progress()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                if turn_id and not interrupted:
-                    interrupted = True
+            now = time.monotonic()
+            if health_probe_id is None:
+                if now - last_protocol_activity >= APP_SERVER_HEALTH_PROBE_IDLE_SECONDS:
+                    health_probe_id = self._next_id()
+                    health_probe_ids.add(health_probe_id)
+                    health_probe_sent_at = now
                     self._send({
-                        "method": "turn/interrupt",
-                        "id": self._next_id(),
-                        "params": {"threadId": self.thread_id, "turnId": turn_id},
+                        "method": "thread/read",
+                        "id": health_probe_id,
+                        "params": {"threadId": self.thread_id, "includeTurns": False},
                     })
-                    deadline = time.monotonic() + TURN_INTERRUPT_GRACE_SECONDS
-                    continue
-                raise AppServerTurnTimeout("advisor turn timed out")
+            elif now - health_probe_sent_at >= APP_SERVER_HEALTH_PROBE_TIMEOUT_SECONDS:
+                missed_health_probes += 1
+                if missed_health_probes >= MAX_MISSED_HEALTH_PROBES:
+                    raise AppServerUnresponsive(
+                        "app-server control plane did not answer health probes"
+                    )
+                health_probe_id = self._next_id()
+                health_probe_ids.add(health_probe_id)
+                health_probe_sent_at = now
+                self._send({
+                    "method": "thread/read",
+                    "id": health_probe_id,
+                    "params": {"threadId": self.thread_id, "includeTurns": False},
+                })
             try:
-                message = self.messages.get(timeout=min(remaining, 1.0))
+                message = self.messages.get(timeout=1.0)
             except queue.Empty:
                 if self.process is None or self.process.poll() is not None:
                     raise AppServerError("app-server exited during advisor turn")
+                if self._reader is not None and not self._reader.is_alive():
+                    raise AppServerError("app-server protocol output closed during advisor turn")
                 continue
+            is_health_response = message.get("id") in health_probe_ids
+            last_protocol_activity = time.monotonic()
+            health_probe_id = None
+            health_probe_ids.clear()
+            missed_health_probes = 0
             self._observe(message)
             if self._handle_server_request(message):
+                continue
+            if is_health_response:
                 continue
             if message.get("id") == request_id:
                 result_turn = message.get("result", {}).get("turn", {})
@@ -459,7 +486,7 @@ class AdvisorWorker:
         update_worker_state(self.session, app_server_pid=app.process.pid if app.process else None)
         return app
 
-    def process_batch(self, state: dict[str, Any]) -> None:
+    def process_batch(self, state: dict[str, Any], lane_key: str | None = None) -> None:
         transcript_raw = state.get("transcript")
         cwd_raw = state.get("cwd")
         if not transcript_raw or not cwd_raw:
@@ -480,7 +507,7 @@ class AdvisorWorker:
                     notes=read_update_result(self.session, update_id),
                     update_id=update_id,
                 )
-            self.finish_batch(generation, new_cursor, None)
+            self.finish_batch(generation, new_cursor, None, lane_key)
             return
 
         update_id = uuid.uuid4().hex
@@ -499,17 +526,8 @@ class AdvisorWorker:
         final_error: Exception | None = None
         succeeded = False
         usage = empty_token_usage()
-        batch_timeout = max(1.0, float(config.get("timeout_seconds", 300)))
-        review_deadline = time.monotonic() + batch_timeout
         attempts_started = 0
         for attempt in range(1, MAX_REVIEW_ATTEMPTS + 1):
-            remaining = review_deadline - time.monotonic()
-            if remaining <= 0:
-                final_error = AppServerTurnTimeout("advisor batch exhausted its total timeout")
-                break
-            attempts_left = MAX_REVIEW_ATTEMPTS - attempt + 1
-            attempt_timeout = min(remaining, attempt_timeout_budget(remaining, attempts_left))
-            attempt_deadline = time.monotonic() + attempt_timeout
             attempts_started = attempt
             update_worker_state(
                 self.session,
@@ -521,16 +539,9 @@ class AdvisorWorker:
             )
             try:
                 app = self.ensure_app(cwd, config, system_prompt)
-                turn_timeout = min(
-                    review_deadline - time.monotonic(),
-                    attempt_deadline - time.monotonic(),
-                )
-                if turn_timeout <= 0:
-                    raise AppServerTurnTimeout("app-server startup exhausted advisor attempt")
                 usage = app.run_turn(
                     update,
                     str(config["reasoning_effort"]),
-                    turn_timeout,
                 )
                 runtime = load_json(runtime_path(self.session), {})
                 if not isinstance(runtime, dict):
@@ -541,16 +552,16 @@ class AdvisorWorker:
                 succeeded = True
                 final_error = None
                 break
-            except (AppServerError, AppServerTurnTimeout, OSError) as error:
+            except (AppServerError, OSError) as error:
                 final_error = error
                 log_error(self.session, f"persistent advisor attempt {attempt}/3 failed: {error}")
-                self.close_app(retire_devtools=isinstance(error, AppServerTurnTimeout))
+                self.close_app(retire_devtools=isinstance(error, AppServerUnresponsive))
                 runtime = load_json(runtime_path(self.session), {})
                 if not isinstance(runtime, dict):
                     runtime = {}
                 runtime["thread_id"] = None
                 save_json(runtime_path(self.session), runtime)
-                if attempt < MAX_REVIEW_ATTEMPTS and review_deadline - time.monotonic() > attempt:
+                if attempt < MAX_REVIEW_ATTEMPTS:
                     time.sleep(attempt)
 
         record_advisor_invocation(
@@ -565,7 +576,7 @@ class AdvisorWorker:
                 self.session,
                 warning=(
                     f"Advisor unavailable after {attempts_started} persistent-worker "
-                    f"attempt{'s' if attempts_started != 1 else ''} within {batch_timeout:.0f}s; "
+                    f"transport attempt{'s' if attempts_started != 1 else ''}; "
                     f"this transcript batch was dropped. {final_error}"
                 ),
                 update_id=update_id,
@@ -574,18 +585,50 @@ class AdvisorWorker:
             flush_deferred(self.session, update_id)
         notes = read_update_result(self.session, update_id)
         append_delivery(self.session, notes=notes, update_id=update_id)
-        self.finish_batch(generation, new_cursor, str(final_error) if final_error else None)
+        self.finish_batch(generation, new_cursor, str(final_error) if final_error else None, lane_key)
 
-    def finish_batch(self, generation: int, cursor: int, error: str | None) -> None:
+    def finish_batch(
+        self,
+        generation: int,
+        cursor: int,
+        error: str | None,
+        lane_key: str | None = None,
+    ) -> None:
         with FileLock(self.session / "queue.lock", timeout=10, stale_after=30):
-            state = load_json(queue_path(self.session), {})
-            if not isinstance(state, dict):
-                state = {}
-            state["processed_cursor"] = max(int(state.get("processed_cursor", 0)), cursor)
-            state["processed_generation"] = max(int(state.get("processed_generation", 0)), generation)
-            state["last_error"] = error
-            state["last_completed_at"] = time.time()
+            raw_state = load_json(queue_path(self.session), {})
+            if lane_key is None and isinstance(raw_state, dict) and not isinstance(raw_state.get("lanes"), dict):
+                raw_state["processed_cursor"] = max(int(raw_state.get("processed_cursor", 0)), cursor)
+                raw_state["processed_generation"] = max(int(raw_state.get("processed_generation", 0)), generation)
+                raw_state["last_error"] = error
+                raw_state["last_completed_at"] = time.time()
+                save_json(queue_path(self.session), raw_state)
+                return
+            state = normalized_queue_state(raw_state)
+            lane = state["lanes"].get(lane_key)
+            if isinstance(lane, dict):
+                lane["processed_cursor"] = max(int(lane.get("processed_cursor", 0)), cursor)
+                lane["processed_generation"] = max(int(lane.get("processed_generation", 0)), generation)
+                lane["last_error"] = error
+                lane["last_completed_at"] = time.time()
             save_json(queue_path(self.session), state)
+
+    @staticmethod
+    def next_pending_lane(state: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        candidates: list[tuple[int, str, dict[str, Any]]] = []
+        for lane_key, lane in state.get("lanes", {}).items():
+            if not isinstance(lane, dict):
+                continue
+            desired = int(lane.get("desired_cursor", 0) or 0)
+            processed = int(lane.get("processed_cursor", 0) or 0)
+            generation = int(lane.get("generation", 0) or 0)
+            processed_generation = int(lane.get("processed_generation", 0) or 0)
+            terminal = str(lane.get("latest_event")) == "Stop" and generation > processed_generation
+            if desired > processed or terminal:
+                candidates.append((generation, str(lane_key), dict(lane)))
+        if not candidates:
+            return None
+        _, lane_key, lane = min(candidates, key=lambda item: (item[0], item[1]))
+        return lane_key, lane
 
     def run(self) -> int:
         update_worker_state(
@@ -602,28 +645,23 @@ class AdvisorWorker:
                 if not config.get("enabled", True):
                     break
                 with FileLock(self.session / "queue.lock", timeout=10, stale_after=30):
-                    state = load_json(queue_path(self.session), {})
-                if not isinstance(state, dict):
-                    state = {}
+                    state = normalized_queue_state(load_json(queue_path(self.session), {}))
                 if state.get("shutdown"):
                     break
-                desired = int(state.get("desired_cursor", 0))
-                processed = int(state.get("processed_cursor", 0))
-                generation = int(state.get("generation", 0))
-                processed_generation = int(state.get("processed_generation", 0))
-                needs_terminal_flush = (
-                    str(state.get("latest_event")) == "Stop"
-                    and generation > processed_generation
-                )
-                if desired > processed or needs_terminal_flush:
+                pending = self.next_pending_lane(state)
+                if pending is not None:
                     coalesce = max(0, int(config.get("coalesce_milliseconds", 350))) / 1000.0
                     if coalesce:
                         time.sleep(coalesce)
                     with FileLock(self.session / "queue.lock", timeout=10, stale_after=30):
-                        state = load_json(queue_path(self.session), state)
+                        state = normalized_queue_state(load_json(queue_path(self.session), state))
+                    pending = self.next_pending_lane(state)
+                    if pending is None:
+                        continue
+                    lane_key, lane = pending
                     update_worker_state(self.session, status="reviewing")
                     try:
-                        self.process_batch(state)
+                        self.process_batch(lane, lane_key)
                     except Exception as error:
                         log_error(self.session, f"advisor worker batch failed unexpectedly: {error}")
                         self.close_app(retire_devtools=True)

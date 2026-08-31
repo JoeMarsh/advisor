@@ -27,14 +27,17 @@ new task so Codex loads them.
 
 `PostToolUse` hooks only coalesce transcript high-water marks and drain completed
 advice. One detached, task-scoped worker owns a persistent `codex app-server`
-process, one advisor thread, and one ordered transcript cursor. The worker runs
-one review at a time and coalesces updates that arrive while a review is pending,
-so Codex's independently scheduled hook processes cannot create parallel advisor
-runs or reorder transcript delivery. Each fast synchronous hook returns promptly
+process, one advisor thread, and an independent ordered cursor for every root or
+subagent transcript in the task. The worker runs one review at a time and
+coalesces each transcript's updates while a review is pending, so Codex's
+independently scheduled hook processes cannot create parallel advisor runs,
+overwrite another agent's cursor, or recount its token usage. Each fast
+synchronous hook returns promptly
 after enqueueing the latest high-water mark and surfaces advice completed by the
-background worker at the next safe tool boundary. `Stop` waits for the final
-high-water mark, flushes deferred notes, and continues the task when terminal
-advice is a blocker.
+background worker at the next safe tool boundary. Both ordinary advice and
+blockers are visible in chat and injected into the active Codex agent's context. `Stop`
+waits for the final high-water mark and continues the task when terminal advice
+is a blocker.
 
 Every delivered advisory is also emitted as a visible hook warning. A compact
 footer compares exact model-processed token usage for the main task and advisor,
@@ -55,9 +58,13 @@ through Codex Auto-review ("Approve for me"). The persistent app-server uses the
 current Codex login and is marked so the plugin cannot recursively advise itself.
 It receives an isolated task-scoped `CODEX_HOME`, so user hooks, notifications,
 plugins, and unrelated MCP servers are not inherited. It runs in its own process
-group. A review timeout first interrupts the active turn, then terminates the
-complete app-server descendant tree if it does not settle; the devtools broker
-and its Node/LSP/DAP descendants are retired as part of that timeout recovery.
+group. Active reviews have no wall-clock deadline: hard tasks and slow model
+servers may continue for as long as needed. During otherwise silent model work,
+the worker probes the local app-server control plane with metadata-only
+`thread/read` requests. Only a dead process, closed protocol stream, or three
+unanswered control-plane probes triggers transport recovery. That recovery
+terminates the complete app-server descendant tree and retires the devtools
+broker and its Node/LSP/DAP descendants before retrying.
 
 Installed plugins store configuration, persistent advisor threads, and usage
 counters in their Codex-provided `PLUGIN_DATA` directory (normally
@@ -76,8 +83,9 @@ whose contents should not be sent to the configured model.
 Codex provides background review with synchronous safe-point context injection
 rather than Oh My Pi's native token-stream steering. That is the unavoidable
 host adapter boundary;
-the singleton runtime, ordered coalescing queue, persistent context, prompt,
-advice formatting, WIP deferral, final blocker continuation, and noise/dedup
+the singleton runtime, per-transcript ordered coalescing queue, persistent
+context, prompt, advice formatting, mid-task delivery, final blocker
+continuation, and noise/dedup
 guards are implemented locally.
 
 ## Controls

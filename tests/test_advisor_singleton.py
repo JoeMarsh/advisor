@@ -25,6 +25,7 @@ from advisor_hook import (  # noqa: E402
     ensure_worker,
     hook_output,
     live_worker_pid,
+    wait_for_generation,
 )
 from advisor_worker import AdvisorWorker  # noqa: E402
 from advisor_worker import app_server_command  # noqa: E402
@@ -45,8 +46,50 @@ class SingletonQueueTests(unittest.TestCase):
             state = json.loads((session / "queue.json").read_text(encoding="utf-8"))
             expected_cursor = transcript.stat().st_size
         self.assertGreater(second_generation, first_generation)
-        self.assertEqual(state["desired_cursor"], expected_cursor)
-        self.assertEqual(state["latest_event"], "PostToolUse")
+        lane = state["lanes"][str(transcript.resolve())]
+        self.assertEqual(lane["desired_cursor"], expected_cursor)
+        self.assertEqual(lane["latest_event"], "PostToolUse")
+
+    def test_root_and_subagent_transcripts_keep_independent_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = root / "session"
+            session.mkdir()
+            primary = root / "primary.jsonl"
+            child = root / "child.jsonl"
+            primary.write_text('{"primary":1}\n', encoding="utf-8")
+            child.write_text('{"child":1}\n', encoding="utf-8")
+            enqueue_update(session, primary, root, "PostToolUse")
+            enqueue_update(session, child, root, "PostToolUse")
+            state = json.loads((session / "queue.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(state["lanes"]), {str(primary.resolve()), str(child.resolve())})
+        self.assertEqual(state["lanes"][str(primary.resolve())]["processed_cursor"], 0)
+        self.assertEqual(state["lanes"][str(child.resolve())]["processed_cursor"], 0)
+
+    def test_wait_targets_its_own_transcript_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            primary = str((session / "primary.jsonl").resolve())
+            child = str((session / "child.jsonl").resolve())
+            (session / "queue.json").write_text(json.dumps({
+                "generation": 8,
+                "shutdown": False,
+                "lanes": {
+                    primary: {"processed_generation": 3},
+                    child: {"processed_generation": 8},
+                },
+            }), encoding="utf-8")
+            with (
+                patch("advisor_hook.live_worker_pid", return_value=1),
+                patch("advisor_hook.time.monotonic", side_effect=[0.0, 0.0, 1.0]),
+                patch("advisor_hook.time.sleep") as sleep,
+            ):
+                wait_for_generation(session, 5, 0.5, primary)
+            sleep.assert_called_once_with(0.1)
+            self.assertEqual(
+                json.loads((session / "queue.json").read_text(encoding="utf-8"))["lanes"][primary]["processed_generation"],
+                3,
+            )
 
     def test_partial_transcript_line_is_not_queued(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -54,7 +97,7 @@ class SingletonQueueTests(unittest.TestCase):
             path.write_bytes(b'{"complete":true}\n{"partial":')
             self.assertEqual(complete_transcript_cursor(path), len(b'{"complete":true}\n'))
 
-    def test_stop_flushes_deferred_advice_without_new_transcript_bytes(self) -> None:
+    def test_stop_surfaces_legacy_deferred_advice_without_new_transcript_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             session = root / "session"
@@ -63,7 +106,15 @@ class SingletonQueueTests(unittest.TestCase):
             transcript.write_text("", encoding="utf-8")
             reset_guard(session)
             start_update(session, "wip")
-            record_advice(session, "wip", "Verify the final cursor.", "concern", True)
+            (session / "guard.json").write_text(json.dumps({
+                "seen": [], "delivered": {}, "updates": {},
+                "deferred": [{
+                    "note": "Verify the final cursor.",
+                    "normalized": "verify the final cursor",
+                    "key": "Verify the final cursor.",
+                    "severity": "concern",
+                }],
+            }), encoding="utf-8")
             AdvisorWorker(session).process_batch({
                 "transcript": str(transcript),
                 "cwd": str(root),

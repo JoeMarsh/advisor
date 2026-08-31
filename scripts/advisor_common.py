@@ -130,6 +130,7 @@ def default_usage_state() -> dict[str, Any]:
             "cursor": 0,
             "transcript": None,
             "context_window": None,
+            "streams": {},
         },
         "advisor": {
             "totals": empty_token_usage(),
@@ -162,6 +163,17 @@ def load_usage_state(session: Path) -> dict[str, Any]:
     state.setdefault("updated_at", None)
     state["main"]["totals"] = normalize_token_usage(state["main"].get("totals"))
     state["main"]["last_total"] = normalize_token_usage(state["main"].get("last_total"))
+    streams = state["main"].get("streams")
+    if not isinstance(streams, dict):
+        streams = {}
+        state["main"]["streams"] = streams
+    for key, stream in list(streams.items()):
+        if not isinstance(stream, dict):
+            del streams[key]
+            continue
+        stream["last_total"] = normalize_token_usage(stream.get("last_total"))
+        stream["cursor"] = max(0, int(stream.get("cursor", 0) or 0))
+        stream["requests"] = max(0, int(stream.get("requests", 0) or 0))
     state["advisor"]["totals"] = normalize_token_usage(state["advisor"].get("totals"))
     return state
 
@@ -182,6 +194,11 @@ def token_usage_delta(current: Any, previous: Any) -> dict[str, int]:
 
 
 def update_main_usage(session: Path, transcript: Path | None) -> dict[str, Any]:
+    with FileLock(session / "usage.lock", timeout=10, stale_after=30):
+        return _update_main_usage_unlocked(session, transcript)
+
+
+def _update_main_usage_unlocked(session: Path, transcript: Path | None) -> dict[str, Any]:
     state = load_usage_state(session)
     main = state["main"]
     if transcript is None or not transcript.is_file():
@@ -189,10 +206,14 @@ def update_main_usage(session: Path, transcript: Path | None) -> dict[str, Any]:
         return state
 
     transcript_key = str(transcript.resolve())
-    cursor = int(main.get("cursor", 0))
-    if main.get("transcript") != transcript_key:
-        cursor = 0
-        main["transcript"] = transcript_key
+    streams = main.setdefault("streams", {})
+    stream_state = streams.setdefault(transcript_key, {
+        "cursor": 0,
+        "last_total": empty_token_usage(),
+        "requests": 0,
+        "context_window": None,
+    })
+    cursor = int(stream_state.get("cursor", 0))
     size = transcript.stat().st_size
     if cursor < 0 or cursor > size:
         cursor = 0
@@ -205,8 +226,8 @@ def update_main_usage(session: Path, transcript: Path | None) -> dict[str, Any]:
         return state
 
     complete = raw[:last_newline + 1]
-    main["cursor"] = cursor + len(complete)
-    previous = normalize_token_usage(main.get("last_total"))
+    stream_state["cursor"] = cursor + len(complete)
+    previous = normalize_token_usage(stream_state.get("last_total"))
     totals = normalize_token_usage(main.get("totals"))
     for line in complete.decode("utf-8", errors="replace").splitlines():
         try:
@@ -223,15 +244,29 @@ def update_main_usage(session: Path, transcript: Path | None) -> dict[str, Any]:
         totals = add_token_usage(totals, _usage_delta(current, previous))
         previous = current
         main["requests"] = int(main.get("requests", 0)) + 1
+        stream_state["requests"] = int(stream_state.get("requests", 0)) + 1
         if info.get("model_context_window") is not None:
-            main["context_window"] = int(info["model_context_window"])
-    main["last_total"] = previous
+            context_window = int(info["model_context_window"])
+            main["context_window"] = context_window
+            stream_state["context_window"] = context_window
+    stream_state["last_total"] = previous
     main["totals"] = totals
     save_usage_state(session, state)
     return state
 
 
 def record_advisor_invocation(
+    session: Path,
+    usage: Any,
+    succeeded: bool,
+    spoke: bool,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    with FileLock(session / "usage.lock", timeout=10, stale_after=30):
+        return _record_advisor_invocation_unlocked(session, usage, succeeded, spoke, config)
+
+
+def _record_advisor_invocation_unlocked(
     session: Path,
     usage: Any,
     succeeded: bool,
@@ -255,6 +290,14 @@ def record_advisor_invocation(
 
 
 def record_visible_advisories(session: Path, notes: list[dict[str, str]]) -> dict[str, Any]:
+    with FileLock(session / "usage.lock", timeout=10, stale_after=30):
+        return _record_visible_advisories_unlocked(session, notes)
+
+
+def _record_visible_advisories_unlocked(
+    session: Path,
+    notes: list[dict[str, str]],
+) -> dict[str, Any]:
     state = load_usage_state(session)
     advisor = state["advisor"]
     advisor["visible_advisories"] = int(advisor.get("visible_advisories", 0)) + len(notes)
@@ -516,21 +559,6 @@ def record_advice(
     advice = {"note": note.strip(), "normalized": normalized, "key": delivery_key}
     if severity is not None:
         advice["severity"] = severity
-
-    if in_progress and severity != "blocker":
-        pending = next((item for item in state["deferred"] if item.get("key") == delivery_key), None)
-        if pending is None:
-            state["deferred"].append(advice)
-        elif current_rank > SEVERITY_RANK.get(pending.get("severity", "nit"), 0):
-            if severity is None:
-                pending.pop("severity", None)
-            else:
-                pending["severity"] = severity
-        save_json(_state_file(session), state)
-        return (
-            "Deferred — primary is mid-turn; this note will be delivered automatically when "
-            "the turn completes. Do not re-raise the same point."
-        )
 
     state["delivered"][delivery_key] = current_rank
     update = state["updates"].setdefault(update_id, {"consumed": False})

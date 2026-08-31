@@ -85,14 +85,11 @@ class AdvisorCommonTests(unittest.TestCase):
         self.assertEqual(record_advice(self.session, "u", "Second concrete risk.", "concern"), "Recorded.")
         self.assertEqual(len(read_update_result(self.session, "u")), 1)
 
-    def test_mid_turn_nonblocker_defers_and_flushes(self) -> None:
+    def test_mid_turn_nonblocker_is_immediate(self) -> None:
         start_update(self.session, "wip")
         response = record_advice(self.session, "wip", "Verify the persisted cursor.", "concern", True)
-        self.assertTrue(response.startswith("Deferred"))
-        self.assertEqual(read_update_result(self.session, "wip"), [])
-        start_update(self.session, "stop")
-        flush_deferred(self.session, "stop")
-        self.assertEqual(read_update_result(self.session, "stop")[0]["note"], "Verify the persisted cursor.")
+        self.assertEqual(response, "Recorded.")
+        self.assertEqual(read_update_result(self.session, "wip")[0]["note"], "Verify the persisted cursor.")
 
     def test_mid_turn_blocker_is_immediate(self) -> None:
         start_update(self.session, "wip")
@@ -288,6 +285,33 @@ class UsageTests(unittest.TestCase):
             self.assertIn("gpt-5.6-luna", report)
             self.assertIn("Visible advisories: 1", report)
             self.assertIn("1 concerns", report)
+
+    def test_main_usage_tracks_multiple_transcripts_without_recounting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory) / "session"
+            session.mkdir()
+
+            def write_usage(path: Path, total: int) -> None:
+                path.write_text(json.dumps({
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {"total_token_usage": {
+                        "input_tokens": total - 10,
+                        "output_tokens": 10,
+                        "total_tokens": total,
+                    }}},
+                }) + "\n", encoding="utf-8")
+
+            root = Path(directory) / "root.jsonl"
+            child = Path(directory) / "child.jsonl"
+            write_usage(root, 100)
+            write_usage(child, 40)
+            update_main_usage(session, root)
+            state = update_main_usage(session, child)
+            state = update_main_usage(session, root)
+            state = update_main_usage(session, child)
+            self.assertEqual(state["main"]["totals"]["total_tokens"], 140)
+            self.assertEqual(state["main"]["requests"], 2)
+            self.assertEqual(len(state["main"]["streams"]), 2)
 
     def test_silent_review_is_counted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

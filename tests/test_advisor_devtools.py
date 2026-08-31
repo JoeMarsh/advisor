@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import queue
 import subprocess
 import sys
 import tempfile
@@ -21,10 +22,50 @@ from advisor_devtools_proxy import ensure_broker, shutdown_broker  # noqa: E402
 
 
 class AdvisorDevtoolsTests(unittest.TestCase):
-    def test_shared_timeout_reserves_three_real_attempts(self) -> None:
-        budget = advisor_worker.attempt_timeout_budget(300, 3)
-        self.assertGreater(budget, 90)
-        self.assertLess(budget, 100)
+    def test_long_turn_uses_health_probe_without_wall_clock_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            client = advisor_worker.AppServerClient([], root, {}, root / "log")
+            client.thread_id = "advisor-thread"
+            client.process = MagicMock()
+            client.process.poll.return_value = None
+            client._reader = MagicMock()
+            client._reader.is_alive.return_value = True
+            sent: list[dict[str, object]] = []
+            client._send = sent.append  # type: ignore[method-assign]
+            client.messages.put({"id": 1, "result": {"turn": {"id": "turn-1"}}})
+            client.messages.put({"id": 2, "result": {"thread": {"status": "active"}}})
+            client.messages.put({
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": "completed"}},
+            })
+            with patch.object(advisor_worker, "APP_SERVER_HEALTH_PROBE_IDLE_SECONDS", 0):
+                client.run_turn("review", "max")
+        self.assertTrue(any(message.get("method") == "thread/read" for message in sent))
+        self.assertFalse(any(message.get("method") == "turn/interrupt" for message in sent))
+
+    def test_unresponsive_control_plane_fails_after_health_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            client = advisor_worker.AppServerClient([], root, {}, root / "log")
+            client.thread_id = "advisor-thread"
+            client.process = MagicMock()
+            client.process.poll.return_value = None
+            client._reader = MagicMock()
+            client._reader.is_alive.return_value = True
+            sent: list[dict[str, object]] = []
+            client._send = sent.append  # type: ignore[method-assign]
+            client.messages.get = MagicMock(side_effect=queue.Empty())  # type: ignore[method-assign]
+            with (
+                patch.object(advisor_worker, "APP_SERVER_HEALTH_PROBE_IDLE_SECONDS", 0),
+                patch.object(advisor_worker, "APP_SERVER_HEALTH_PROBE_TIMEOUT_SECONDS", 0),
+                patch.object(advisor_worker, "MAX_MISSED_HEALTH_PROBES", 2),
+            ):
+                with self.assertRaises(advisor_worker.AppServerUnresponsive):
+                    client.run_turn("review", "max")
+        probes = [message for message in sent if message.get("method") == "thread/read"]
+        self.assertEqual(len(probes), 2)
+        self.assertFalse(any(message.get("method") == "turn/interrupt" for message in sent))
 
     def test_parses_only_advisor_tool_lists(self) -> None:
         text = """
@@ -146,7 +187,7 @@ input.on("line", line => {
         self.assertEqual(captured["approvalsReviewer"], "auto_review")
         self.assertEqual(captured["sandbox"], "read-only")
 
-    def test_worker_timeout_retires_app_server_and_broker(self) -> None:
+    def test_unresponsive_worker_retires_app_server_and_broker(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             session = root / "session"
@@ -162,7 +203,7 @@ input.on("line", line => {
             }) + "\n", encoding="utf-8")
             worker = advisor_worker.AdvisorWorker(session)
             app = MagicMock()
-            app.run_turn.side_effect = advisor_worker.AppServerTurnTimeout("expired")
+            app.run_turn.side_effect = advisor_worker.AppServerUnresponsive("health probes failed")
             worker.ensure_app = MagicMock(return_value=app)  # type: ignore[method-assign]
             state = {
                 "transcript": str(transcript),
@@ -176,7 +217,6 @@ input.on("line", line => {
                     "enabled": True,
                     "model": "gpt-5.6-luna",
                     "reasoning_effort": "max",
-                    "timeout_seconds": 30,
                 }),
                 patch.object(advisor_worker, "build_system_prompt", return_value="instructions"),
                 patch.object(advisor_worker, "shutdown_broker", return_value=True) as shutdown,
@@ -188,9 +228,9 @@ input.on("line", line => {
             self.assertEqual(app.run_turn.call_count, 3)
             notes, warnings = drain_deliveries(session)
             self.assertEqual(notes, [])
-            self.assertIn("after 3 persistent-worker attempts", warnings[0])
+            self.assertIn("after 3 persistent-worker transport attempts", warnings[0])
 
-    def test_retry_can_recover_within_the_shared_batch_budget(self) -> None:
+    def test_retry_can_recover_after_transport_failure(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             session = root / "session"
@@ -224,7 +264,6 @@ input.on("line", line => {
                     "enabled": True,
                     "model": "gpt-5.6-luna",
                     "reasoning_effort": "max",
-                    "timeout_seconds": 30,
                 }),
                 patch.object(advisor_worker, "build_system_prompt", return_value="instructions"),
                 patch.object(advisor_worker.time, "sleep", return_value=None),
