@@ -37,6 +37,11 @@ MAX_ITEM_CHARS = 40_000
 MAX_UPDATE_CHARS = 64_000
 WORKER_STALE_SECONDS = 30
 DEVTOOLS_SERVER = "godot-rust-devtools"
+CODEX_TRANSPORT_INSTRUCTIONS = """<codex-transport>
+This block only adapts delivery to Codex; it does not change Advisor judgment.
+- For every non-silent result, MUST call `advise` exactly once. Do not emit advice as assistant commentary or final text.
+- For a silent result, emit no assistant text and do not call `advise`.
+</codex-transport>"""
 DEVTOOLS_TOOL_GROUPS = {
     "lsp": [
         "devtools_status",
@@ -299,7 +304,10 @@ def devtools_mcp_script() -> Path | None:
 
 
 def build_system_prompt(cwd: Path) -> str:
-    parts = [(plugin_root() / "prompts" / "system.md").read_text(encoding="utf-8")]
+    parts = [
+        (plugin_root() / "prompts" / "system.md").read_text(encoding="utf-8"),
+        CODEX_TRANSPORT_INSTRUCTIONS,
+    ]
     context = render_context_prompt(cwd)
     if context:
         parts.append(context)

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -19,11 +20,14 @@ from advisor_common import (
     flush_deferred,
     load_config,
     load_json,
+    normalize_note,
     normalize_token_usage,
     read_update_result,
+    record_advice,
     record_advisor_invocation,
     save_json,
     start_update,
+    SUPPRESSED_PHRASES,
     token_usage_delta,
     update_had_advice,
 )
@@ -64,6 +68,52 @@ APP_SERVER_HEALTH_PROBE_IDLE_SECONDS = 30.0
 APP_SERVER_HEALTH_PROBE_TIMEOUT_SECONDS = 30.0
 MAX_MISSED_HEALTH_PROBES = 3
 MAX_REVIEW_ATTEMPTS = 3
+PLAIN_SEVERITY_PREFIX = re.compile(
+    r"^\s*(?:\[(nit|concern|blocker)\]|(nit|concern|blocker)\s*:)\s*",
+    re.IGNORECASE,
+)
+PLAIN_ADVISORY_XML = re.compile(
+    r"^\s*<advisory(?P<attributes>[^>]*)>\s*(?P<note>.*?)\s*</advisory>\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+XML_SEVERITY = re.compile(r"\bseverity\s*=\s*['\"](nit|concern|blocker)['\"]", re.IGNORECASE)
+
+
+def parse_plain_advisory(text: str | None) -> tuple[str, str | None] | None:
+    if not isinstance(text, str):
+        return None
+    value = text.strip()
+    if not value:
+        return None
+    severity: str | None = None
+    xml = PLAIN_ADVISORY_XML.match(value)
+    if xml:
+        value = xml.group("note").strip()
+        severity_match = XML_SEVERITY.search(xml.group("attributes"))
+        if severity_match:
+            severity = severity_match.group(1).lower()
+    else:
+        prefix = PLAIN_SEVERITY_PREFIX.match(value)
+        if prefix:
+            severity = (prefix.group(1) or prefix.group(2)).lower()
+            value = value[prefix.end():].strip()
+    if not value or normalize_note(value) in SUPPRESSED_PHRASES:
+        return None
+    return value, severity
+
+
+def record_plain_advisory_fallback(
+    session: Path,
+    update_id: str,
+    text: str | None,
+    in_progress: bool,
+) -> bool:
+    parsed = parse_plain_advisory(text)
+    if parsed is None:
+        return False
+    note, severity = parsed
+    record_advice(session, update_id, note, severity, in_progress)
+    return bool(read_update_result(session, update_id))
 
 
 class AppServerClient:
@@ -86,6 +136,7 @@ class AppServerClient:
         self.latest_usage = empty_token_usage()
         self.completed_items: list[dict[str, Any]] = []
         self.last_turn: dict[str, Any] | None = None
+        self.last_agent_message: str | None = None
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
         self.progress_callback = progress_callback
@@ -221,11 +272,35 @@ class AppServerClient:
             item = params.get("item") if isinstance(params, dict) else None
             if isinstance(item, dict):
                 self.completed_items.append(item)
+                text = self._agent_message_text(item)
+                if text:
+                    self.last_agent_message = text
         elif message.get("method") == "turn/completed":
             params = message.get("params", {})
             turn = params.get("turn") if isinstance(params, dict) else None
             if isinstance(turn, dict):
                 self.last_turn = turn
+
+    @staticmethod
+    def _agent_message_text(item: dict[str, Any]) -> str | None:
+        item_type = "".join(character for character in str(item.get("type", "")).lower() if character.isalnum())
+        if item_type != "agentmessage":
+            return None
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        content = item.get("content")
+        if not isinstance(content, list):
+            return None
+        parts: list[str] = []
+        for entry in content:
+            if not isinstance(entry, dict):
+                continue
+            candidate = entry.get("text")
+            if isinstance(candidate, str) and candidate.strip():
+                parts.append(candidate.strip())
+        joined = "\n".join(parts).strip()
+        return joined or None
 
     def request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
         request_id = self._next_id()
@@ -291,6 +366,7 @@ class AppServerClient:
         if not self.thread_id:
             raise AppServerError("advisor thread is not open")
         before = self.latest_usage
+        self.last_agent_message = None
         request_id = self._next_id()
         self._send({
             "method": "turn/start",
@@ -563,6 +639,13 @@ class AdvisorWorker:
                     update,
                     str(config["reasoning_effort"]),
                 )
+                if not update_had_advice(self.session, update_id):
+                    record_plain_advisory_fallback(
+                        self.session,
+                        update_id,
+                        app.last_agent_message,
+                        in_progress,
+                    )
                 runtime = load_json(runtime_path(self.session), {})
                 if not isinstance(runtime, dict):
                     runtime = {}

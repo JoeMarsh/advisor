@@ -34,6 +34,7 @@ from advisor_common import (  # noqa: E402
 )
 from advisor_hook import (  # noqa: E402
     MAX_UPDATE_CHARS,
+    build_system_prompt,
     hook_output,
     mcp_overrides,
     read_transcript_delta,
@@ -344,6 +345,13 @@ class McpBridgeTests(unittest.TestCase):
         self.assertEqual(params["baseInstructions"], "UPSTREAM SYSTEM PROMPT")
         self.assertEqual(params["approvalsReviewer"], "auto_review")
         self.assertEqual(params["sandbox"], "read-only")
+
+    def test_codex_transport_suffix_requires_advise_tool_delivery(self) -> None:
+        upstream = (ROOT / "prompts" / "system.md").read_text(encoding="utf-8").rstrip()
+        prompt = build_system_prompt(ROOT)
+        self.assertTrue(prompt.startswith(upstream))
+        self.assertIn("For every non-silent result, MUST call `advise` exactly once", prompt)
+        self.assertIn("Do not emit advice as assistant commentary or final text", prompt)
 
     def test_worker_uses_app_server_not_per_update_exec(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

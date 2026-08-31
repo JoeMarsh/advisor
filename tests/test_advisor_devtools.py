@@ -17,11 +17,115 @@ sys.path.insert(0, str(SCRIPTS))
 
 import advisor_hook  # noqa: E402
 import advisor_worker  # noqa: E402
-from advisor_common import drain_deliveries  # noqa: E402
+from advisor_common import drain_deliveries, read_update_result, start_update  # noqa: E402
 from advisor_devtools_proxy import ensure_broker, shutdown_broker  # noqa: E402
 
 
 class AdvisorDevtoolsTests(unittest.TestCase):
+    def test_turn_captures_last_nonempty_plain_agent_message(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            client = advisor_worker.AppServerClient([], root, {}, root / "log")
+            client.thread_id = "advisor-thread"
+            client.process = MagicMock()
+            client.process.poll.return_value = None
+            client._reader = MagicMock()
+            client._reader.is_alive.return_value = True
+            client._send = MagicMock()  # type: ignore[method-assign]
+            client.messages.put({"id": 1, "result": {"turn": {"id": "turn-1"}}})
+            client.messages.put({
+                "method": "item/completed",
+                "params": {"item": {
+                    "type": "agentMessage",
+                    "text": "[blocker] Preserve authoritative grounding.",
+                    "phase": "commentary",
+                }},
+            })
+            client.messages.put({
+                "method": "item/completed",
+                "params": {"item": {"type": "agentMessage", "text": "", "phase": "final_answer"}},
+            })
+            client.messages.put({
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": "completed"}},
+            })
+            client.run_turn("review", "max")
+        self.assertEqual(
+            client.last_agent_message,
+            "[blocker] Preserve authoritative grounding.",
+        )
+
+    def test_plain_blocker_falls_back_into_normal_delivery_result(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            session = Path(raw)
+            start_update(session, "u")
+            recorded = advisor_worker.record_plain_advisory_fallback(
+                session,
+                "u",
+                "[blocker] Authoritative pose does not affect grounding.",
+                False,
+            )
+            notes = read_update_result(session, "u")
+        self.assertTrue(recorded)
+        self.assertEqual(notes[0]["severity"], "blocker")
+        self.assertEqual(notes[0]["note"], "Authoritative pose does not affect grounding.")
+
+    def test_plain_silence_phrase_stays_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            session = Path(raw)
+            start_update(session, "u")
+            recorded = advisor_worker.record_plain_advisory_fallback(
+                session, "u", "No concerns", True
+            )
+            notes = read_update_result(session, "u")
+        self.assertFalse(recorded)
+        self.assertEqual(notes, [])
+
+    def test_process_batch_delivers_plain_agent_message_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            session = root / "session"
+            session.mkdir()
+            transcript = root / "rollout.jsonl"
+            transcript.write_text(json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                },
+            }) + "\n", encoding="utf-8")
+            worker = advisor_worker.AdvisorWorker(session)
+            app = MagicMock()
+            app.run_turn.return_value = advisor_worker.empty_token_usage()
+            app.last_agent_message = "[concern] Verify the authoritative contact geometry."
+            app.thread_id = "advisor-thread"
+            app.latest_usage = advisor_worker.empty_token_usage()
+            worker.ensure_app = MagicMock(return_value=app)  # type: ignore[method-assign]
+            state = {
+                "transcript": str(transcript),
+                "cwd": str(root),
+                "processed_cursor": 0,
+                "generation": 1,
+                "latest_event": "Stop",
+                "is_root": True,
+            }
+            with (
+                patch.object(advisor_worker, "load_config", return_value={
+                    "enabled": True,
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "max",
+                }),
+                patch.object(advisor_worker, "build_system_prompt", return_value="instructions"),
+            ):
+                worker.process_batch(state)
+            notes, warnings = drain_deliveries(session, str(transcript.resolve()), True)
+            usage = json.loads((session / "usage.json").read_text(encoding="utf-8"))
+        self.assertEqual(warnings, [])
+        self.assertEqual(notes[0]["severity"], "concern")
+        self.assertEqual(notes[0]["note"], "Verify the authoritative contact geometry.")
+        self.assertEqual(usage["advisor"]["silent_reviews"], 0)
+
     def test_long_turn_uses_health_probe_without_wall_clock_interrupt(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

@@ -39,6 +39,10 @@ transcript drains only its own completed deliveries. Advice from subagent work
 therefore stays with that subagent and never consumes main-agent context. Both
 ordinary advice and blockers are injected into the originating agent's context,
 while `systemMessage` also supplies Codex's hook warning for that same lane.
+The unchanged Oh My Pi prompt is followed by a Codex-only transport rule that
+routes every non-silent result through `advise`. If the model nevertheless emits
+ordinary assistant text, the worker captures the last non-empty message and
+normalizes it through the same dedupe, feed, usage, lane, and Stop-block paths.
 `Stop` and `SubagentStop` wait for their own final high-water mark and continue
 only that originating agent when terminal advice is a blocker.
 
