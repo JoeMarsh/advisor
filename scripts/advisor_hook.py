@@ -79,6 +79,13 @@ def transcript_path(payload: dict[str, Any]) -> Path | None:
     return Path(str(raw)).resolve() if raw else None
 
 
+def is_root_transcript(payload: dict[str, Any], path: Path | None) -> bool:
+    if path is None:
+        return False
+    session_id = session_identity(payload).strip().lower()
+    return bool(session_id and session_id != "unknown-session" and session_id in path.name.lower())
+
+
 def session_cwd(payload: dict[str, Any]) -> Path:
     raw = payload.get("cwd") or os.getcwd()
     return Path(str(raw)).resolve()
@@ -589,7 +596,13 @@ def hook_output(
         if content:
             output["hookSpecificOutput"] = {
                 "hookEventName": "PostToolUse",
-                "additionalContext": content,
+                "additionalContext": (
+                    "Surface this Advisor feedback to the user now. In your next commentary "
+                    "message, write `Advisor (<severity>): <note>` for every advisory below, "
+                    "preserving each note verbatim. This is non-blocking feedback: after "
+                    "surfacing it, independently weigh it and continue the task.\n\n"
+                    + content
+                ),
             }
         return output
     if event == "Stop":
@@ -628,6 +641,7 @@ def main() -> int:
     session = session_dir(session_identity(payload))
     path = transcript_path(payload)
     cwd = session_cwd(payload)
+    root_transcript = is_root_transcript(payload, path)
     update_main_usage(session, path)
 
     if event == "SessionEnd":
@@ -672,16 +686,17 @@ def main() -> int:
     generation = enqueue_update(session, path, cwd, event)
     ensure_worker(session)
 
-    notes, warnings = drain_deliveries(session)
+    notes, warnings = drain_deliveries(session) if root_transcript else ([], [])
     if not notes and not warnings:
-        if event == "Stop":
+        if event == "Stop" and root_transcript:
             wait_for_generation(
                 session,
                 generation,
                 float(config.get("timeout_seconds", 300)) + 20,
                 queue_lane_key(path),
             )
-        notes, warnings = drain_deliveries(session)
+        if root_transcript:
+            notes, warnings = drain_deliveries(session)
 
     if notes:
         usage_state = record_visible_advisories(session, notes)

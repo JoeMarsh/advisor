@@ -493,6 +493,9 @@ class McpBridgeTests(unittest.TestCase):
         content = output["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Advisor usage", output["systemMessage"])
         self.assertNotIn("Advisor usage", content)
+        self.assertIn("Surface this Advisor feedback to the user now", content)
+        self.assertIn("preserving each note verbatim", content)
+        self.assertIn("Inspect the failed assertion.", content)
 
 
 if __name__ == "__main__":

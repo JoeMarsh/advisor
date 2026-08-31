@@ -34,10 +34,13 @@ independently scheduled hook processes cannot create parallel advisor runs,
 overwrite another agent's cursor, or recount its token usage. Each fast
 synchronous hook returns promptly
 after enqueueing the latest high-water mark and surfaces advice completed by the
-background worker at the next safe tool boundary. Both ordinary advice and
-blockers are visible in chat and injected into the active Codex agent's context. `Stop`
-waits for the final high-water mark and continues the task when terminal advice
-is a blocker.
+background worker at the next safe tool boundary. Only the root transcript
+drains completed deliveries, preventing subagent checkpoints from consuming
+feedback outside the main chat. Both ordinary advice and blockers are injected
+into the root agent's context with an instruction to echo the note verbatim in a
+commentary message, while `systemMessage` also supplies Codex's hook warning.
+`Stop` waits for the final high-water mark and continues the task when terminal
+advice is a blocker.
 
 Every delivered advisory is also emitted as a visible hook warning. A compact
 footer compares exact model-processed token usage for the main task and advisor,

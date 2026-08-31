@@ -24,6 +24,7 @@ from advisor_hook import (  # noqa: E402
     enqueue_update,
     ensure_worker,
     hook_output,
+    is_root_transcript,
     live_worker_pid,
     wait_for_generation,
 )
@@ -195,6 +196,14 @@ class SingletonQueueTests(unittest.TestCase):
         self.assertIsNone(state["app_server_pid"])
 
 class DeliveryVisibilityTests(unittest.TestCase):
+    def test_only_root_transcript_is_a_user_chat_delivery_checkpoint(self) -> None:
+        session_id = "01a05930-9404-7e52-b355-f44fed18068e"
+        payload = {"session_id": session_id}
+        root = Path(f"rollout-2026-08-31T19-59-11-{session_id}.jsonl")
+        child = Path("rollout-2026-08-31T20-02-38-01a05933-be1f-7bb2-b33d-292713174dd2.jsonl")
+        self.assertTrue(is_root_transcript(payload, root))
+        self.assertFalse(is_root_transcript(payload, child))
+
     def test_completed_advice_is_drained_exactly_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             session = Path(directory)
