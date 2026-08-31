@@ -1,6 +1,6 @@
 {
   "name": "advisor",
-  "version": "0.1.0+codex.20260830183545",
+  "version": "0.1.0+codex.20260831155418",
   "description": "A concurrent, mid-task advisor modeled closely on Oh My Pi's advisor runtime.",
   "author": {
     "name": "Oh My Pi contributors and JoeMarsh"

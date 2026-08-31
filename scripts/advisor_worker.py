@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from advisor_common import (
     FileLock,
@@ -53,8 +53,26 @@ class AppServerTurnTimeout(TimeoutError):
     pass
 
 
+TURN_INTERRUPT_GRACE_SECONDS = 5.0
+MAX_REVIEW_ATTEMPTS = 3
+
+
+def attempt_timeout_budget(remaining: float, attempts_left: int) -> float:
+    attempts = max(1, attempts_left)
+    retry_backoff = sum(range(1, attempts))
+    reserved = TURN_INTERRUPT_GRACE_SECONDS * attempts + retry_backoff
+    return max(0.001, (remaining - reserved) / attempts)
+
+
 class AppServerClient:
-    def __init__(self, command: list[str], cwd: Path, environment: dict[str, str], log_path: Path):
+    def __init__(
+        self,
+        command: list[str],
+        cwd: Path,
+        environment: dict[str, str],
+        log_path: Path,
+        progress_callback: Callable[[], None] | None = None,
+    ):
         self.command = command
         self.cwd = cwd
         self.environment = environment
@@ -68,6 +86,11 @@ class AppServerClient:
         self.last_turn: dict[str, Any] | None = None
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
+        self.progress_callback = progress_callback
+
+    def _progress(self) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback()
 
     def start(self) -> None:
         self.process = subprocess.Popen(
@@ -195,6 +218,7 @@ class AppServerClient:
         self._send({"method": method, "id": request_id, "params": params})
         deadline = time.monotonic() + timeout
         while True:
+            self._progress()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AppServerTurnTimeout(f"timed out waiting for {method}")
@@ -269,6 +293,7 @@ class AppServerClient:
         turn_id: str | None = None
         interrupted = False
         while True:
+            self._progress()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if turn_id and not interrupted:
@@ -278,7 +303,7 @@ class AppServerClient:
                         "id": self._next_id(),
                         "params": {"threadId": self.thread_id, "turnId": turn_id},
                     })
-                    deadline = time.monotonic() + 5
+                    deadline = time.monotonic() + TURN_INTERRUPT_GRACE_SECONDS
                     continue
                 raise AppServerTurnTimeout("advisor turn timed out")
             try:
@@ -410,6 +435,7 @@ class AdvisorWorker:
         command = app_server_command(self.session, cwd, active_file, "bash" in tools)
         environment = app_server_environment(self.session)
         app = AppServerClient(command, cwd, environment, self.session / "advisor.log")
+        app.progress_callback = lambda: update_worker_state(self.session, status="reviewing")
         app.start()
         runtime = load_json(runtime_path(self.session), {})
         stored_thread = runtime.get("thread_id") if isinstance(runtime, dict) else None
@@ -473,18 +499,38 @@ class AdvisorWorker:
         final_error: Exception | None = None
         succeeded = False
         usage = empty_token_usage()
-        review_deadline = time.monotonic() + float(config.get("timeout_seconds", 300))
-        for attempt in range(1, 4):
+        batch_timeout = max(1.0, float(config.get("timeout_seconds", 300)))
+        review_deadline = time.monotonic() + batch_timeout
+        attempts_started = 0
+        for attempt in range(1, MAX_REVIEW_ATTEMPTS + 1):
             remaining = review_deadline - time.monotonic()
             if remaining <= 0:
                 final_error = AppServerTurnTimeout("advisor batch exhausted its total timeout")
                 break
+            attempts_left = MAX_REVIEW_ATTEMPTS - attempt + 1
+            attempt_timeout = min(remaining, attempt_timeout_budget(remaining, attempts_left))
+            attempt_deadline = time.monotonic() + attempt_timeout
+            attempts_started = attempt
+            update_worker_state(
+                self.session,
+                status="reviewing",
+                review_attempt=attempt,
+                review_attempts=MAX_REVIEW_ATTEMPTS,
+                review_started_at=time.time(),
+                active_generation=generation,
+            )
             try:
                 app = self.ensure_app(cwd, config, system_prompt)
+                turn_timeout = min(
+                    review_deadline - time.monotonic(),
+                    attempt_deadline - time.monotonic(),
+                )
+                if turn_timeout <= 0:
+                    raise AppServerTurnTimeout("app-server startup exhausted advisor attempt")
                 usage = app.run_turn(
                     update,
                     str(config["reasoning_effort"]),
-                    remaining,
+                    turn_timeout,
                 )
                 runtime = load_json(runtime_path(self.session), {})
                 if not isinstance(runtime, dict):
@@ -504,7 +550,7 @@ class AdvisorWorker:
                     runtime = {}
                 runtime["thread_id"] = None
                 save_json(runtime_path(self.session), runtime)
-                if attempt < 3 and review_deadline - time.monotonic() > attempt:
+                if attempt < MAX_REVIEW_ATTEMPTS and review_deadline - time.monotonic() > attempt:
                     time.sleep(attempt)
 
         record_advisor_invocation(
@@ -518,7 +564,8 @@ class AdvisorWorker:
             append_delivery(
                 self.session,
                 warning=(
-                    "Advisor unavailable after three persistent-worker attempts; "
+                    f"Advisor unavailable after {attempts_started} persistent-worker "
+                    f"attempt{'s' if attempts_started != 1 else ''} within {batch_timeout:.0f}s; "
                     f"this transcript batch was dropped. {final_error}"
                 ),
                 update_id=update_id,
@@ -575,8 +622,29 @@ class AdvisorWorker:
                     with FileLock(self.session / "queue.lock", timeout=10, stale_after=30):
                         state = load_json(queue_path(self.session), state)
                     update_worker_state(self.session, status="reviewing")
-                    self.process_batch(state)
-                    update_worker_state(self.session, status="running")
+                    try:
+                        self.process_batch(state)
+                    except Exception as error:
+                        log_error(self.session, f"advisor worker batch failed unexpectedly: {error}")
+                        self.close_app(retire_devtools=True)
+                        append_delivery(
+                            self.session,
+                            warning=f"Advisor worker recovered from an unexpected batch failure: {error}",
+                        )
+                        update_worker_state(
+                            self.session,
+                            status="failed",
+                            last_error=str(error),
+                            review_attempt=None,
+                            active_generation=None,
+                        )
+                        raise
+                    update_worker_state(
+                        self.session,
+                        status="running",
+                        review_attempt=None,
+                        active_generation=None,
+                    )
                     last_work = time.monotonic()
                     continue
                 if time.monotonic() - last_work >= float(config.get("worker_idle_seconds", 3600)):

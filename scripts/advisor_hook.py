@@ -17,6 +17,7 @@ from advisor_process import (
 
 from advisor_common import (
     FileLock,
+    append_delivery,
     drain_deliveries,
     compact_usage_footer,
     format_advisories,
@@ -33,7 +34,8 @@ from advisor_common import (
 
 
 MAX_ITEM_CHARS = 40_000
-MAX_UPDATE_CHARS = 160_000
+MAX_UPDATE_CHARS = 64_000
+WORKER_STALE_SECONDS = 30
 DEVTOOLS_SERVER = "godot-rust-devtools"
 DEVTOOLS_TOOL_GROUPS = {
     "lsp": [
@@ -372,14 +374,45 @@ def queue_state_path(session: Path) -> Path:
 
 
 def live_worker_pid(session: Path) -> int | None:
-    state = load_json(worker_state_path(session), {})
-    if not isinstance(state, dict):
-        return None
-    try:
-        pid = int(state.get("pid", 0))
-    except (TypeError, ValueError):
-        return None
-    return pid if process_is_running(pid) else None
+    with FileLock(session / "worker-state.lock", timeout=10, stale_after=30):
+        state = load_json(worker_state_path(session), {})
+        if not isinstance(state, dict):
+            return None
+        try:
+            pid = int(state.get("pid", 0))
+        except (TypeError, ValueError):
+            return None
+        if not process_is_running(pid):
+            return None
+        now = time.time()
+        try:
+            heartbeat = float(state.get("heartbeat", 0))
+        except (TypeError, ValueError):
+            heartbeat = 0
+        try:
+            started_at = float(state.get("started_at", 0))
+        except (TypeError, ValueError):
+            started_at = 0
+        fresh_start = (
+            state.get("status") == "starting"
+            and started_at
+            and now - started_at <= WORKER_STALE_SECONDS
+        )
+        if (heartbeat and now - heartbeat <= WORKER_STALE_SECONDS) or fresh_start:
+            return pid
+        terminate_pid_tree(pid)
+        state.update({
+            "status": "stale",
+            "stopped_at": now,
+            "heartbeat": now,
+            "app_server_pid": None,
+        })
+        save_json(worker_state_path(session), state)
+    append_delivery(
+        session,
+        warning="Advisor worker heartbeat expired; its process tree was terminated and restarted.",
+    )
+    return None
 
 
 def ensure_worker(session: Path) -> int:
@@ -400,12 +433,13 @@ def ensure_worker(session: Path) -> int:
             close_fds=True,
             **advisor_detached_process_kwargs(),
         )
-        save_json(worker_state_path(session), {
-            "pid": process.pid,
-            "status": "starting",
-            "started_at": time.time(),
-            "heartbeat": time.time(),
-        })
+        with FileLock(session / "worker-state.lock", timeout=10, stale_after=30):
+            save_json(worker_state_path(session), {
+                "pid": process.pid,
+                "status": "starting",
+                "started_at": time.time(),
+                "heartbeat": time.time(),
+            })
         return process.pid
 
 
@@ -418,13 +452,12 @@ def stop_worker(session: Path, wait_seconds: float = 2.0) -> None:
         state["generation"] = int(state.get("generation", 0)) + 1
         save_json(queue_state_path(session), state)
     pid = live_worker_pid(session)
-    if pid is None:
-        return
-    deadline = time.monotonic() + wait_seconds
-    while process_is_running(pid) and time.monotonic() < deadline:
-        time.sleep(0.05)
-    if process_is_running(pid):
-        terminate_pid_tree(pid)
+    if pid is not None:
+        deadline = time.monotonic() + wait_seconds
+        while process_is_running(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if process_is_running(pid):
+            terminate_pid_tree(pid)
     shutdown_broker(session / "devtools-broker.json")
 
 

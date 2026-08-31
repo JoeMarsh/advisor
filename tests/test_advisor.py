@@ -32,7 +32,12 @@ from advisor_common import (  # noqa: E402
     update_had_advice,
     update_main_usage,
 )
-from advisor_hook import hook_output, mcp_overrides, read_transcript_delta  # noqa: E402
+from advisor_hook import (  # noqa: E402
+    MAX_UPDATE_CHARS,
+    hook_output,
+    mcp_overrides,
+    read_transcript_delta,
+)
 from advisor_worker import (  # noqa: E402
     AppServerClient,
     app_server_command,
@@ -119,6 +124,32 @@ class TranscriptCursorTests(unittest.TestCase):
             second, same_cursor = read_transcript_delta(path, cursor)
             self.assertEqual(second, "")
             self.assertEqual(cursor, same_cursor)
+
+    def test_large_backlog_keeps_only_a_bounded_recent_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "rollout.jsonl"
+            entries = [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": value * 40_000}],
+                    },
+                }
+                for value in ("a", "b", "c")
+            ]
+            transcript.write_text(
+                "".join(json.dumps(entry) + "\n" for entry in entries),
+                encoding="utf-8",
+            )
+            delta, cursor = read_transcript_delta(transcript, 0)
+            size = transcript.stat().st_size
+        prefix = "[earlier delta truncated]\n"
+        self.assertTrue(delta.startswith(prefix))
+        self.assertLessEqual(len(delta), MAX_UPDATE_CHARS + len(prefix))
+        self.assertIn("c" * 100, delta)
+        self.assertEqual(cursor, size)
 
 
 class PromptSubmitAdapterTests(unittest.TestCase):

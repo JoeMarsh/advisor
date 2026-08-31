@@ -16,10 +16,16 @@ sys.path.insert(0, str(SCRIPTS))
 
 import advisor_hook  # noqa: E402
 import advisor_worker  # noqa: E402
+from advisor_common import drain_deliveries  # noqa: E402
 from advisor_devtools_proxy import ensure_broker, shutdown_broker  # noqa: E402
 
 
 class AdvisorDevtoolsTests(unittest.TestCase):
+    def test_shared_timeout_reserves_three_real_attempts(self) -> None:
+        budget = advisor_worker.attempt_timeout_budget(300, 3)
+        self.assertGreater(budget, 90)
+        self.assertLess(budget, 100)
+
     def test_parses_only_advisor_tool_lists(self) -> None:
         text = """
 other:
@@ -170,7 +176,7 @@ input.on("line", line => {
                     "enabled": True,
                     "model": "gpt-5.6-luna",
                     "reasoning_effort": "max",
-                    "timeout_seconds": 0.01,
+                    "timeout_seconds": 30,
                 }),
                 patch.object(advisor_worker, "build_system_prompt", return_value="instructions"),
                 patch.object(advisor_worker, "shutdown_broker", return_value=True) as shutdown,
@@ -179,6 +185,55 @@ input.on("line", line => {
                 worker.process_batch(state)
             self.assertGreaterEqual(shutdown.call_count, 1)
             shutdown.assert_any_call(session / "devtools-broker.json")
+            self.assertEqual(app.run_turn.call_count, 3)
+            notes, warnings = drain_deliveries(session)
+            self.assertEqual(notes, [])
+            self.assertIn("after 3 persistent-worker attempts", warnings[0])
+
+    def test_retry_can_recover_within_the_shared_batch_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            session = root / "session"
+            session.mkdir()
+            transcript = root / "rollout.jsonl"
+            transcript.write_text(json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "review"}],
+                },
+            }) + "\n", encoding="utf-8")
+            worker = advisor_worker.AdvisorWorker(session)
+            first = MagicMock()
+            first.run_turn.side_effect = advisor_worker.AppServerError("disconnect")
+            second = MagicMock()
+            second.run_turn.return_value = advisor_worker.empty_token_usage()
+            second.thread_id = "advisor-thread"
+            second.latest_usage = advisor_worker.empty_token_usage()
+            worker.ensure_app = MagicMock(side_effect=[first, second])  # type: ignore[method-assign]
+            state = {
+                "transcript": str(transcript),
+                "cwd": str(root),
+                "processed_cursor": 0,
+                "generation": 1,
+                "latest_event": "PostToolUse",
+            }
+            with (
+                patch.object(advisor_worker, "load_config", return_value={
+                    "enabled": True,
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "max",
+                    "timeout_seconds": 30,
+                }),
+                patch.object(advisor_worker, "build_system_prompt", return_value="instructions"),
+                patch.object(advisor_worker.time, "sleep", return_value=None),
+            ):
+                worker.process_batch(state)
+            usage = json.loads((session / "usage.json").read_text(encoding="utf-8"))
+        self.assertEqual(first.run_turn.call_count, 1)
+        self.assertEqual(second.run_turn.call_count, 1)
+        self.assertEqual(usage["advisor"]["successful_reviews"], 1)
 
 
 if __name__ == "__main__":

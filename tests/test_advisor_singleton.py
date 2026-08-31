@@ -24,6 +24,7 @@ from advisor_hook import (  # noqa: E402
     enqueue_update,
     ensure_worker,
     hook_output,
+    live_worker_pid,
 )
 from advisor_worker import AdvisorWorker  # noqa: E402
 from advisor_worker import app_server_command  # noqa: E402
@@ -74,6 +75,41 @@ class SingletonQueueTests(unittest.TestCase):
         self.assertEqual(notes[0]["note"], "Verify the final cursor.")
         self.assertEqual(warnings, [])
 
+    def test_unexpected_batch_failure_preserves_unreviewed_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = root / "session"
+            session.mkdir()
+            transcript = root / "rollout.jsonl"
+            transcript.write_text("pending\n", encoding="utf-8")
+            (session / "queue.json").write_text(json.dumps({
+                "transcript": str(transcript),
+                "cwd": str(root),
+                "desired_cursor": transcript.stat().st_size,
+                "processed_cursor": 0,
+                "generation": 1,
+                "processed_generation": 0,
+                "latest_event": "PostToolUse",
+                "shutdown": False,
+            }), encoding="utf-8")
+            worker = AdvisorWorker(session)
+            with (
+                patch("advisor_worker.load_config", return_value={
+                    "enabled": True,
+                    "coalesce_milliseconds": 0,
+                    "worker_idle_seconds": 3600,
+                }),
+                patch.object(worker, "process_batch", side_effect=RuntimeError("boom")),
+                self.assertRaises(RuntimeError),
+            ):
+                worker.run()
+            state = json.loads((session / "queue.json").read_text(encoding="utf-8"))
+            notes, warnings = drain_deliveries(session)
+        self.assertEqual(state["processed_cursor"], 0)
+        self.assertEqual(state["processed_generation"], 0)
+        self.assertEqual(notes, [])
+        self.assertIn("unexpected batch failure", warnings[0])
+
     def test_one_live_worker_is_reused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             session = Path(directory)
@@ -83,6 +119,29 @@ class SingletonQueueTests(unittest.TestCase):
             ):
                 self.assertEqual(ensure_worker(session), 4242)
             popen.assert_not_called()
+
+    def test_stale_worker_is_terminated_and_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            (session / "worker.json").write_text(json.dumps({
+                "pid": 4242,
+                "status": "reviewing",
+                "heartbeat": 1,
+                "app_server_pid": 4343,
+            }), encoding="utf-8")
+            with (
+                patch("advisor_hook.process_is_running", return_value=True),
+                patch("advisor_hook.terminate_pid_tree") as terminate,
+                patch("advisor_hook.time.time", return_value=100),
+            ):
+                self.assertIsNone(live_worker_pid(session))
+            notes, warnings = drain_deliveries(session)
+            state = json.loads((session / "worker.json").read_text(encoding="utf-8"))
+        terminate.assert_called_once_with(4242)
+        self.assertEqual(notes, [])
+        self.assertIn("heartbeat expired", warnings[0])
+        self.assertEqual(state["status"], "stale")
+        self.assertIsNone(state["app_server_pid"])
 
 class DeliveryVisibilityTests(unittest.TestCase):
     def test_completed_advice_is_drained_exactly_once(self) -> None:
