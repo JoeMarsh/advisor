@@ -20,6 +20,11 @@ class PluginPackageTests(unittest.TestCase):
         self.assertEqual(
             server["args"], ["scripts/advisor_feed_mcp.mjs"]
         )
+        self.assertEqual(server["default_tools_approval_mode"], "auto")
+
+    def test_manifest_uses_at_most_three_starter_prompts(self):
+        manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
+        self.assertLessEqual(len(manifest["interface"]["defaultPrompt"]), 3)
 
 
 if __name__ == "__main__":
