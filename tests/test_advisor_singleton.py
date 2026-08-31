@@ -26,6 +26,7 @@ from advisor_hook import (  # noqa: E402
     hook_output,
     is_root_transcript,
     live_worker_pid,
+    transcript_path,
     wait_for_generation,
 )
 from advisor_worker import AdvisorWorker  # noqa: E402
@@ -204,6 +205,13 @@ class DeliveryVisibilityTests(unittest.TestCase):
         self.assertTrue(is_root_transcript(payload, root))
         self.assertFalse(is_root_transcript(payload, child))
 
+    def test_subagent_stop_uses_the_agent_transcript_lane(self) -> None:
+        payload = {
+            "transcript_path": "root.jsonl",
+            "agent_transcript_path": "child.jsonl",
+        }
+        self.assertEqual(transcript_path(payload), Path("child.jsonl").resolve())
+
     def test_completed_advice_is_drained_exactly_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             session = Path(directory)
@@ -278,6 +286,12 @@ class DeliveryVisibilityTests(unittest.TestCase):
         self.assertIn("SessionEnd", hooks["hooks"])
         handler = hooks["hooks"]["SessionEnd"][0]["hooks"][0]
         self.assertEqual(handler["timeout"], 3)
+
+    def test_subagent_stop_hook_is_a_synchronous_final_checkpoint(self) -> None:
+        hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        handler = hooks["hooks"]["SubagentStop"][0]["hooks"][0]
+        self.assertNotIn("async", handler)
+        self.assertEqual(handler["timeout"], 600)
 
     def test_post_tool_use_is_a_fast_synchronous_delivery_checkpoint(self) -> None:
         hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))

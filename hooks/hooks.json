@@ -63,6 +63,19 @@
         ]
       }
     ],
+    "SubagentStop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/advisor_hook.py\"",
+            "commandWindows": "cmd.exe /d /s /c %PLUGIN_ROOT%\\scripts\\advisor_python.cmd advisor_hook.py",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

@@ -39,8 +39,8 @@ transcript drains only its own completed deliveries. Advice from subagent work
 therefore stays with that subagent and never consumes main-agent context. Both
 ordinary advice and blockers are injected into the originating agent's context,
 while `systemMessage` also supplies Codex's hook warning for that same lane.
-`Stop` waits for the final high-water mark and continues the task when terminal
-advice is a blocker.
+`Stop` and `SubagentStop` wait for their own final high-water mark and continue
+only that originating agent when terminal advice is a blocker.
 
 Every advisory and runtime warning is additionally copied into a durable,
 read-only user feed without injecting it into another agent. `$advisor feed`

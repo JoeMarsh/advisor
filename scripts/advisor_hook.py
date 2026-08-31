@@ -75,7 +75,12 @@ def session_identity(payload: dict[str, Any]) -> str:
 
 
 def transcript_path(payload: dict[str, Any]) -> Path | None:
-    raw = payload.get("transcript_path") or payload.get("transcriptPath")
+    raw = (
+        payload.get("agent_transcript_path")
+        or payload.get("agentTranscriptPath")
+        or payload.get("transcript_path")
+        or payload.get("transcriptPath")
+    )
     return Path(str(raw)).resolve() if raw else None
 
 
@@ -611,7 +616,7 @@ def hook_output(
                 ),
             }
         return output
-    if event == "Stop":
+    if event in {"Stop", "SubagentStop"}:
         has_blocker = any(note.get("severity") == "blocker" for note in notes)
         already_continuing = bool(payload.get("stop_hook_active") or payload.get("stopHookActive"))
         if has_blocker and not already_continuing:
@@ -699,7 +704,7 @@ def main() -> int:
         include_unscoped=root_transcript,
     )
     if not notes and not warnings:
-        if event == "Stop":
+        if event in {"Stop", "SubagentStop"}:
             wait_for_generation(
                 session,
                 generation,
@@ -723,7 +728,7 @@ def main() -> int:
         compact_usage_footer(usage_state),
         warnings,
     )
-    if output or event == "Stop":
+    if output or event in {"Stop", "SubagentStop"}:
         json.dump(output, sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
     return 0

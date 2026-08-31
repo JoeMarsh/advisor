@@ -483,6 +483,13 @@ class McpBridgeTests(unittest.TestCase):
         self.assertNotIn("decision", second)
         self.assertIn("systemMessage", second)
 
+    def test_subagent_stop_blocker_continues_only_that_subagent_once(self) -> None:
+        notes = [{"note": "Run the subagent's focused check.", "severity": "blocker"}]
+        first = hook_output("SubagentStop", notes, {})
+        self.assertEqual(first["decision"], "block")
+        second = hook_output("SubagentStop", notes, {"stop_hook_active": True})
+        self.assertNotIn("decision", second)
+
     def test_mid_task_advice_is_visible_to_its_originating_agent_without_forced_echo(self) -> None:
         output = hook_output(
             "PostToolUse",

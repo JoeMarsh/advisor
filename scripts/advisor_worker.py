@@ -510,7 +510,7 @@ class AdvisorWorker:
         processed_cursor = int(state.get("processed_cursor", 0))
         delta, new_cursor = read_transcript_delta(transcript, processed_cursor)
         generation = int(state.get("generation", 0))
-        in_progress = str(state.get("latest_event")) != "Stop"
+        in_progress = str(state.get("latest_event")) not in {"Stop", "SubagentStop"}
         if not delta:
             if not in_progress:
                 update_id = uuid.uuid4().hex
@@ -650,7 +650,10 @@ class AdvisorWorker:
             processed = int(lane.get("processed_cursor", 0) or 0)
             generation = int(lane.get("generation", 0) or 0)
             processed_generation = int(lane.get("processed_generation", 0) or 0)
-            terminal = str(lane.get("latest_event")) == "Stop" and generation > processed_generation
+            terminal = (
+                str(lane.get("latest_event")) in {"Stop", "SubagentStop"}
+                and generation > processed_generation
+            )
             if desired > processed or terminal:
                 candidates.append((generation, str(lane_key), dict(lane)))
         if not candidates:
