@@ -88,6 +88,49 @@ class AdvisorFeedMcpTests(unittest.TestCase):
         resource = responses[4]["contents"][0]
         self.assertEqual(resource["mimeType"], "text/html;profile=mcp-app")
         self.assertIn("read_advisor_feed", resource["text"])
+        self.assertIn("ui/notifications/tool-input", resource["text"])
+        self.assertIn("params?.toolInput||params||null", resource["text"])
+        self.assertIn("if(sessionId||sessionKey)void refresh()", resource["text"])
+        self.assertIn("if(!sessionId&&!sessionKey)", resource["text"])
+        self.assertIn("incomingId!==sessionId", resource["text"])
+        self.assertIn("incomingKey!==sessionKey", resource["text"])
+        self.assertIn("session_id:sessionId,session_key:sessionKey", resource["text"])
+
+    def test_missing_targeted_session_stays_pinned_and_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session_id = "01a-empty-feed-test"
+            expected_key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:24]
+            request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "show_advisor_feed",
+                    "arguments": {"session_id": session_id},
+                },
+            }
+            environment = os.environ.copy()
+            environment["PLUGIN_DATA"] = directory
+            completed = subprocess.run(
+                ["node", str(ROOT / "scripts" / "advisor_feed_mcp.mjs")],
+                cwd=ROOT,
+                env=environment,
+                input=json.dumps(request) + "\n",
+                text=True,
+                encoding="utf-8",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        snapshot = json.loads(completed.stdout)["result"]["structuredContent"]
+        self.assertEqual(snapshot["session_id"], session_id)
+        self.assertEqual(snapshot["session_key"], expected_key)
+        self.assertEqual(snapshot["activity"]["status"], "not-started")
+        self.assertEqual(snapshot["usage"]["main_total"], 0)
+        self.assertEqual(snapshot["usage"]["advisor_total"], 0)
+        self.assertEqual(snapshot["feed"], [])
 
 
 if __name__ == "__main__":
